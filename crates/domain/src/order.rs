@@ -238,8 +238,8 @@ impl DomainEvent for Event {
 /// now carries the state the implemented commands validate against:
 /// whether the payment currency is fiat (never `$MADE`), whether the order
 /// total equals the sum of its line items, whether the confirming webhook was
-/// HMAC-verified, whether this payment intent was already processed, and whether
-/// the refund/entitlement ledger balances.
+/// HMAC-verified, whether this payment intent was already processed by this
+/// Order, and whether the refund/entitlement ledger balances.
 ///
 /// A fresh Order from [`Order::new`] is confirmable: it settles in fiat via
 /// Stripe, its total matches its line items, its webhook is HMAC-verified, its
@@ -261,6 +261,8 @@ pub struct Order {
     /// Whether this Stripe payment intent has already been processed. Confirming
     /// an already-processed intent would double-fulfill, so it is rejected.
     payment_intent_already_processed: bool,
+    /// Whether this Order has already accepted a verified payment confirmation.
+    payment_confirmed: bool,
     /// Whether every refund reverses exactly the entitlements the order granted
     /// (the refund/entitlement ledger balances).
     refund_reverses_exactly: bool,
@@ -280,6 +282,7 @@ impl Order {
             total_matches_line_items: true,
             webhook_hmac_verified: true,
             payment_intent_already_processed: false,
+            payment_confirmed: false,
             refund_reverses_exactly: true,
         }
     }
@@ -318,6 +321,11 @@ impl Order {
     /// Record whether this Stripe payment intent has already been processed.
     pub fn set_payment_intent_already_processed(&mut self, already: bool) {
         self.payment_intent_already_processed = already;
+    }
+
+    /// Record whether this Order has accepted a verified payment confirmation.
+    pub fn set_payment_confirmed(&mut self, confirmed: bool) {
+        self.payment_confirmed = confirmed;
     }
 
     /// Record whether every refund reverses exactly the entitlements granted.
@@ -372,6 +380,21 @@ impl Order {
             return Err(DomainError::InvariantViolation(format!(
                 "order '{}' payment intent was already processed; processing is idempotent per \
                  Stripe payment intent (no double-fulfillment)",
+                self.id
+            )));
+        }
+        Ok(())
+    }
+
+    /// Refund idempotency invariant: a processed intent is valid for refund only
+    /// when this Order's own successful confirmation produced that processed
+    /// state. Otherwise refunding would operate on an externally pre-processed
+    /// intent and risk double-fulfillment.
+    fn ensure_refund_intent_state_is_consistent(&self) -> Result<(), DomainError> {
+        if self.payment_intent_already_processed && !self.payment_confirmed {
+            return Err(DomainError::InvariantViolation(format!(
+                "order '{}' payment intent was already processed outside this Order; processing \
+                 is idempotent per Stripe payment intent (no double-fulfillment)",
                 self.id
             )));
         }
@@ -484,6 +507,7 @@ impl Order {
         // Mark the payment intent processed so a replayed webhook for the same
         // intent is rejected by the idempotency invariant — no double-fulfillment.
         self.payment_intent_already_processed = true;
+        self.payment_confirmed = true;
 
         let event = Event::PaymentConfirmed(PaymentConfirmed {
             order_id: cmd.order_id,
@@ -524,7 +548,7 @@ impl Order {
         self.ensure_fiat_via_stripe()?;
         self.ensure_total_matches_line_items()?;
         self.ensure_webhook_hmac_verified()?;
-        self.ensure_not_already_processed()?;
+        self.ensure_refund_intent_state_is_consistent()?;
         self.ensure_refund_reverses_exactly()?;
 
         let event = Event::OrderRefunded(OrderRefunded {
@@ -596,6 +620,7 @@ mod tests {
         order.set_total_matches_line_items(true);
         order.set_webhook_hmac_verified(true);
         order.set_payment_intent_already_processed(false);
+        order.set_payment_confirmed(false);
         order.set_refund_reverses_exactly(true);
         order
     }
@@ -958,6 +983,28 @@ mod tests {
         assert_eq!(order.version(), 1);
         assert_eq!(order.uncommitted_events().len(), 1);
         assert_eq!(order.uncommitted_events()[0].event_type(), "order.refunded");
+    }
+
+    #[test]
+    fn refunds_after_successful_payment_confirmation() {
+        let mut order = ready_order();
+
+        order
+            .execute(valid_cmd().into_command())
+            .expect("payment confirmation should succeed");
+        let events = order
+            .execute(valid_refund_cmd().into_command())
+            .expect("a confirmed order should be refundable");
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_type(), "order.refunded");
+        assert_eq!(order.version(), 2);
+        assert_eq!(order.uncommitted_events().len(), 2);
+        assert_eq!(
+            order.uncommitted_events()[0].event_type(),
+            "payment.confirmed"
+        );
+        assert_eq!(order.uncommitted_events()[1].event_type(), "order.refunded");
     }
 
     // Scenario: RefundOrderCmd rejected — Payment currency is fiat via Stripe
