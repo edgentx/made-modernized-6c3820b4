@@ -1015,6 +1015,14 @@ impl GameSession {
                 "a defenderId must be provided".to_string(),
             ));
         }
+        let defending_player = Self::opponent_of(seat);
+        let expected_defender_id = self.outfit_at(defending_player).boss_name.clone();
+        if cmd.defender_id != expected_defender_id {
+            return Err(DomainError::InvariantViolation(format!(
+                "defenderId '{}' does not name player {defending_player:?}'s Boss target '{}'",
+                cmd.defender_id, expected_defender_id
+            )));
+        }
 
         // Enforce every match-play invariant before applying the attack.
         self.ensure_boards_within_caps()?;
@@ -1033,7 +1041,6 @@ impl GameSession {
             )));
         }
 
-        let defending_player = Self::opponent_of(seat);
         let defeated_player_id = self.outfit_at(defending_player).name.clone();
 
         let resolved = Event::CombatResolved(CombatResolved {
@@ -2095,6 +2102,17 @@ mod tests {
         let err = session
             .execute(DeclareAttack::new("m-1", "m-1-a", "attacker-1", "").into_command())
             .expect_err("a blank defenderId must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(session.version(), 0);
+    }
+
+    // An attack that resolves into boss.defeated must target the opposing Boss.
+    #[test]
+    fn declare_attack_rejects_non_opposing_boss_defender_id() {
+        let mut session = valid_session();
+        let err = session
+            .execute(DeclareAttack::new("m-1", "m-1-a", "attacker-1", "target-1").into_command())
+            .expect_err("a non-Boss defenderId must be rejected");
         assert!(matches!(err, DomainError::InvariantViolation(_)));
         assert_eq!(session.version(), 0);
     }
