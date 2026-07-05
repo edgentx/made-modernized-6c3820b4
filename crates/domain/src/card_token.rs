@@ -27,10 +27,16 @@
 //! a player for a serialized cosmetic edition, geo-checked by jurisdiction: it
 //! validates the target token, the player, the wallet address, the jurisdiction,
 //! and the serial number, enforces the same four invariants, and on success
-//! emits [`Event::WalletLinked`] (`wallet.linked`). This module is hand-written
-//! (it does not use `shared::stub_aggregate!`) but preserves the same public
-//! surface as the scaffolded contexts: a [`CardToken`] aggregate and a
-//! [`CardTokenRepository`] port.
+//! emits [`Event::WalletLinked`] (`wallet.linked`).
+//!
+//! [`VerifyOwnershipCmd`] (`VerifyOwnershipCmd`) confirms on-chain ownership at
+//! match start via the oracle: given a `playerId`, the `tokenIds` being played,
+//! and the `matchId`, it enforces the same four invariants and on success emits
+//! [`Event::OwnershipVerified`] (`ownership.verified`).
+//!
+//! This module is hand-written (it does not use `shared::stub_aggregate!`) but
+//! preserves the same public surface as the scaffolded contexts: a
+//! [`CardToken`] aggregate and a [`CardTokenRepository`] port.
 
 use serde::{Deserialize, Serialize};
 
@@ -51,6 +57,10 @@ const STAGE_METADATA: &str = "StageMetadataCmd";
 /// The command name [`CardToken::execute`] recognizes to link a
 /// custodial/WalletConnect wallet to a player for a serialized cosmetic edition.
 const LINK_WALLET: &str = "LinkWalletCmd";
+
+/// The command name [`CardToken::execute`] recognizes to verify on-chain
+/// ownership of a set of card tokens at match start.
+const VERIFY_OWNERSHIP: &str = "VerifyOwnershipCmd";
 
 /// The `MintCardTokenCmd` payload: which token is being minted, which staged
 /// IPFS metadata record it resolves to, and the serialized cosmetic edition's
@@ -93,6 +103,52 @@ impl MintCardTokenCmd {
     pub fn into_command(&self) -> Command {
         // Serialization of a plain data struct to a Vec cannot fail here.
         let payload = serde_json::to_vec(self).expect("MintCardTokenCmd is always serializable");
+        Command::with_payload(Self::COMMAND, payload)
+    }
+}
+
+/// The `VerifyOwnershipCmd` payload: which player is asserting ownership, which
+/// ERC-1155 `tokenIds` are being brought into the match, and the `matchId`
+/// ownership is verified for at match start. Field names use the token
+/// marketplace's `camelCase` schema.
+///
+/// Build one directly and turn it into a [`Command`] with
+/// [`VerifyOwnershipCmd::into_command`], or decode it from a command payload via
+/// [`serde_json`] inside [`CardToken::execute`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VerifyOwnershipCmd {
+    /// The player whose on-chain ownership is being verified.
+    pub player_id: String,
+    /// The ERC-1155 token ids being verified for the match.
+    pub token_ids: Vec<String>,
+    /// The match this ownership check gates entry to.
+    pub match_id: String,
+}
+
+impl VerifyOwnershipCmd {
+    /// The command name this maps to.
+    pub const COMMAND: &'static str = VERIFY_OWNERSHIP;
+
+    /// Build a command verifying that `player_id` owns `token_ids` for
+    /// `match_id`.
+    pub fn new(
+        player_id: impl Into<String>,
+        token_ids: impl IntoIterator<Item = impl Into<String>>,
+        match_id: impl Into<String>,
+    ) -> Self {
+        Self {
+            player_id: player_id.into(),
+            token_ids: token_ids.into_iter().map(Into::into).collect(),
+            match_id: match_id.into(),
+        }
+    }
+
+    /// Encode this command as a [`shared::Command`] carrying a JSON payload,
+    /// ready to hand to [`CardToken::execute`].
+    pub fn into_command(&self) -> Command {
+        // Serialization of a plain data struct to a Vec cannot fail here.
+        let payload = serde_json::to_vec(self).expect("VerifyOwnershipCmd is always serializable");
         Command::with_payload(Self::COMMAND, payload)
     }
 }
@@ -279,6 +335,18 @@ pub struct WalletLinked {
     pub serial_number: String,
 }
 
+/// The ownership check that succeeded, carried by [`Event::OwnershipVerified`]
+/// and thus by the emitted `ownership.verified` event.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OwnershipVerified {
+    /// The player whose on-chain ownership was verified.
+    pub player_id: String,
+    /// The ERC-1155 token ids verified for the match.
+    pub token_ids: Vec<String>,
+    /// The match this ownership check gated entry to.
+    pub match_id: String,
+}
+
 /// Domain events emitted by [`CardToken`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Event {
@@ -289,6 +357,8 @@ pub enum Event {
     /// A custodial/WalletConnect wallet was linked to a player for a cosmetic
     /// edition.
     WalletLinked(WalletLinked),
+    /// On-chain ownership of a set of tokens was verified at match start.
+    OwnershipVerified(OwnershipVerified),
 }
 
 impl DomainEvent for Event {
@@ -297,6 +367,7 @@ impl DomainEvent for Event {
             Event::CardTokenMinted(_) => "card.token.minted",
             Event::MetadataStaged(_) => "metadata.staged",
             Event::WalletLinked(_) => "wallet.linked",
+            Event::OwnershipVerified(_) => "ownership.verified",
         }
     }
 }
@@ -319,6 +390,11 @@ pub struct CardToken {
     ipfs_metadata_record_resolvable: bool,
     /// Serial numbers already consumed by minted cosmetic editions.
     used_serial_numbers: Vec<String>,
+    /// Whether serialized cosmetic editions carry unique, non-reusable serial
+    /// numbers. Commands that supply a concrete serial (e.g. minting) check it
+    /// against [`CardToken::used_serial_numbers`]; commands that only assert
+    /// ownership (e.g. verification) check this state flag.
+    serial_numbers_unique: bool,
     /// Whether on-chain ownership has been verified before on-face render.
     on_chain_ownership_verified_for_render: bool,
 }
@@ -336,6 +412,7 @@ impl CardToken {
             ownership_verified_server_authoritatively: true,
             ipfs_metadata_record_resolvable: true,
             used_serial_numbers: Vec::new(),
+            serial_numbers_unique: true,
             on_chain_ownership_verified_for_render: true,
         }
     }
@@ -369,6 +446,12 @@ impl CardToken {
     /// Mark a serial number as already consumed by a minted cosmetic edition.
     pub fn record_used_serial_number(&mut self, serial_number: impl Into<String>) {
         self.used_serial_numbers.push(serial_number.into());
+    }
+
+    /// Record whether serialized cosmetic editions carry unique, non-reusable
+    /// serial numbers (`false` models a duplicate/reused serial in circulation).
+    pub fn set_serial_numbers_unique(&mut self, unique: bool) {
+        self.serial_numbers_unique = unique;
     }
 
     /// Record whether on-chain ownership was verified before the cosmetic can
@@ -414,6 +497,20 @@ impl CardToken {
             return Err(DomainError::InvariantViolation(format!(
                 "card token '{}' serial number '{serial_number}' has already been used; serialized \
                  cosmetic editions carry a unique, non-reusable serial number",
+                self.id
+            )));
+        }
+        Ok(())
+    }
+
+    /// Serial invariant (state form): serialized cosmetic editions carry a
+    /// unique, non-reusable serial number. Used by commands that assert
+    /// ownership without supplying a concrete serial to check.
+    fn ensure_serial_numbers_unique(&self) -> Result<(), DomainError> {
+        if !self.serial_numbers_unique {
+            return Err(DomainError::InvariantViolation(format!(
+                "card token '{}' has a duplicated cosmetic serial number; serialized cosmetic \
+                 editions carry a unique, non-reusable serial number",
                 self.id
             )));
         }
@@ -584,6 +681,51 @@ impl CardToken {
         self.root.record(Box::new(event.clone()));
         Ok(vec![event])
     }
+
+    /// Handle `VerifyOwnershipCmd`: verify the command carries a valid
+    /// `playerId`, at least one `tokenId` (one of which names this CardToken),
+    /// and a `matchId`; enforce every token marketplace invariant so that
+    /// ownership is only ever confirmed server-authoritatively; and emit
+    /// [`Event::OwnershipVerified`].
+    fn verify_ownership(&mut self, cmd: VerifyOwnershipCmd) -> Result<Vec<Event>, DomainError> {
+        if cmd.player_id.trim().is_empty() {
+            return Err(DomainError::InvariantViolation(format!(
+                "card token '{}' requires a valid playerId to verify ownership",
+                self.id
+            )));
+        }
+        if cmd.match_id.trim().is_empty() {
+            return Err(DomainError::InvariantViolation(format!(
+                "card token '{}' requires a valid matchId to verify ownership",
+                self.id
+            )));
+        }
+        if cmd.token_ids.is_empty() || cmd.token_ids.iter().any(|id| id.trim().is_empty()) {
+            return Err(DomainError::InvariantViolation(format!(
+                "card token '{}' requires at least one non-empty tokenId to verify ownership",
+                self.id
+            )));
+        }
+        if !cmd.token_ids.iter().any(|id| id == &self.id) {
+            return Err(DomainError::InvariantViolation(format!(
+                "command verifies ownership of {:?} but none name this aggregate, card token '{}'",
+                cmd.token_ids, self.id
+            )));
+        }
+
+        self.ensure_ownership_verified_server_authoritatively()?;
+        self.ensure_ipfs_metadata_record_resolvable()?;
+        self.ensure_serial_numbers_unique()?;
+        self.ensure_on_chain_ownership_verified_for_render()?;
+
+        let event = Event::OwnershipVerified(OwnershipVerified {
+            player_id: cmd.player_id,
+            token_ids: cmd.token_ids,
+            match_id: cmd.match_id,
+        });
+        self.root.record(Box::new(event.clone()));
+        Ok(vec![event])
+    }
 }
 
 impl Aggregate for CardToken {
@@ -618,6 +760,15 @@ impl Aggregate for CardToken {
                     DomainError::InvariantViolation(format!("malformed LinkWalletCmd payload: {e}"))
                 })?;
                 self.link_wallet(cmd)
+            }
+            VERIFY_OWNERSHIP => {
+                let cmd: VerifyOwnershipCmd =
+                    serde_json::from_slice(&command.payload).map_err(|e| {
+                        DomainError::InvariantViolation(format!(
+                            "malformed VerifyOwnershipCmd payload: {e}"
+                        ))
+                    })?;
+                self.verify_ownership(cmd)
             }
             // Any other command is unknown to this aggregate.
             _ => Err(DomainError::unknown_command(
@@ -1097,5 +1248,139 @@ mod tests {
         assert_eq!(command.name, LinkWalletCmd::COMMAND);
         let decoded: LinkWalletCmd = serde_json::from_slice(&command.payload).unwrap();
         assert_eq!(decoded, valid_link_cmd());
+    }
+
+    // ---- VerifyOwnershipCmd (S-63) ----------------------------------------
+
+    /// A command asserting that player `player-7` owns `token-01` (among the
+    /// tokens brought into `match-42`).
+    fn valid_verify_cmd() -> VerifyOwnershipCmd {
+        VerifyOwnershipCmd::new("player-7", ["token-01", "token-02"], "match-42")
+    }
+
+    // Scenario: Successfully execute VerifyOwnershipCmd.
+    #[test]
+    fn verifies_and_emits_ownership_verified_event() {
+        let mut token = ready_token();
+
+        let events = token
+            .execute(valid_verify_cmd().into_command())
+            .expect("valid ownership verification should succeed");
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_type(), "ownership.verified");
+        match &events[0] {
+            Event::OwnershipVerified(verified) => {
+                assert_eq!(verified.player_id, "player-7");
+                assert_eq!(verified.token_ids, vec!["token-01", "token-02"]);
+                assert_eq!(verified.match_id, "match-42");
+            }
+            other => panic!("expected OwnershipVerified, got {other:?}"),
+        }
+        assert_eq!(token.version(), 1);
+        assert_eq!(token.uncommitted_events().len(), 1);
+        assert_eq!(
+            token.uncommitted_events()[0].event_type(),
+            "ownership.verified"
+        );
+    }
+
+    // Scenario: rejected - Ownership is verified server-authoritatively at match
+    // start; client-asserted ownership is never trusted.
+    #[test]
+    fn verify_rejects_when_ownership_not_server_authoritative() {
+        let mut token = ready_token();
+        token.set_ownership_verified_server_authoritatively(false);
+
+        let err = token
+            .execute(valid_verify_cmd().into_command())
+            .expect_err("client-asserted ownership must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(token.version(), 0);
+    }
+
+    // Scenario: rejected - Every tokenId maps to a resolvable IPFS metadata
+    // record (name, cost, art URL, effect ref).
+    #[test]
+    fn verify_rejects_when_ipfs_metadata_record_is_not_resolvable() {
+        let mut token = ready_token();
+        token.set_ipfs_metadata_record_resolvable(false);
+
+        let err = token
+            .execute(valid_verify_cmd().into_command())
+            .expect_err("unresolvable staged metadata must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(token.version(), 0);
+    }
+
+    // Scenario: rejected - Serialized cosmetic editions carry a unique,
+    // non-reusable serial number.
+    #[test]
+    fn verify_rejects_when_serial_numbers_are_not_unique() {
+        let mut token = ready_token();
+        token.set_serial_numbers_unique(false);
+
+        let err = token
+            .execute(valid_verify_cmd().into_command())
+            .expect_err("a duplicated cosmetic serial must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(token.version(), 0);
+    }
+
+    // Scenario: rejected - A cosmetic renders on-face only after verified
+    // on-chain ownership.
+    #[test]
+    fn verify_rejects_when_on_chain_ownership_not_verified_for_render() {
+        let mut token = ready_token();
+        token.set_on_chain_ownership_verified_for_render(false);
+
+        let err = token
+            .execute(valid_verify_cmd().into_command())
+            .expect_err("unverified on-chain ownership must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(token.version(), 0);
+    }
+
+    // A verification whose tokenIds never name this aggregate is rejected before
+    // any invariant runs.
+    #[test]
+    fn verify_rejects_when_no_token_id_names_this_aggregate() {
+        let mut token = ready_token();
+        let cmd = VerifyOwnershipCmd::new("player-7", ["token-98", "token-99"], "match-42");
+
+        let err = token
+            .execute(cmd.into_command())
+            .expect_err("a verification for other tokens must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(token.version(), 0);
+    }
+
+    // Commands missing any required field (or with an empty tokenId list) are
+    // rejected.
+    #[test]
+    fn verify_rejects_command_with_missing_fields() {
+        let cases = [
+            VerifyOwnershipCmd::new("   ", ["token-01"], "match-42"),
+            VerifyOwnershipCmd::new("player-7", Vec::<String>::new(), "match-42"),
+            VerifyOwnershipCmd::new("player-7", ["   "], "match-42"),
+            VerifyOwnershipCmd::new("player-7", ["token-01"], "   "),
+        ];
+        for cmd in cases {
+            let mut token = ready_token();
+            let err = token
+                .execute(cmd.into_command())
+                .expect_err("a command with a missing field must be rejected");
+            assert!(matches!(err, DomainError::InvariantViolation(_)));
+            assert_eq!(token.version(), 0);
+        }
+    }
+
+    #[test]
+    fn verify_command_payload_round_trips() {
+        let cmd = valid_verify_cmd();
+        let command = cmd.into_command();
+        assert_eq!(command.name, VerifyOwnershipCmd::COMMAND);
+        let decoded: VerifyOwnershipCmd = serde_json::from_slice(&command.payload).unwrap();
+        assert_eq!(decoded, valid_verify_cmd());
     }
 }
