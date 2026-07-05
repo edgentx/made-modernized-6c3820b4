@@ -11,10 +11,16 @@
 //! Build for the web:
 //! `wasm-pack build crates/game-session -- --features wasm`
 //!
-//! The only command implemented so far is [`StartMatch`] (`StartMatchCmd`): it
+//! The first command implemented is [`StartMatch`] (`StartMatchCmd`): it
 //! initializes a session from two [`OutfitConfig`]s, an RNG seed, and each
 //! Outfit's Boss, enforcing the match-play rules-contract invariants up front,
-//! and on success emits [`Event::MatchStarted`] (`match.started`). The module is
+//! and on success emits [`Event::MatchStarted`] (`match.started`).
+//!
+//! [`Mulligan`] (`MulliganCmd`) then applies a player's opening-hand redraw
+//! selection: it validates the redraw request for the turn-holding player,
+//! re-checks the same rules-contract invariants against the session's opening
+//! state, and on success emits [`Event::MulliganCompleted`]
+//! (`mulligan.completed`). The module is
 //! hand-written (it no longer uses `shared::stub_aggregate!`) but preserves the
 //! same public surface — a [`GameSession`] aggregate and a
 //! [`GameSessionRepository`] port — so the persistence adapters in
@@ -30,8 +36,11 @@ use shared::{Aggregate, AggregateRoot, Command, DomainError, DomainEvent, Reposi
 /// used for command routing.
 const AGGREGATE_TYPE: &str = "GameSession";
 
-/// The command name [`GameSession::execute`] recognizes.
+/// The `StartMatchCmd` command name [`GameSession::execute`] recognizes.
 const START_MATCH: &str = "StartMatchCmd";
+
+/// The `MulliganCmd` command name [`GameSession::execute`] recognizes.
+const MULLIGAN: &str = "MulliganCmd";
 
 /// A player's board may hold at most this many Operators simultaneously.
 pub const MAX_OPERATORS: usize = 7;
@@ -167,6 +176,55 @@ impl StartMatch {
     }
 }
 
+/// The `MulliganCmd` payload: the match being played, the player performing the
+/// opening-hand redraw, and the specific card identities that player is sending
+/// back to be redrawn. Field names are the match-play schema's `camelCase`.
+///
+/// Build one directly and turn it into a [`Command`] with
+/// [`Mulligan::into_command`], or decode it from a command payload via
+/// [`serde_json`] inside [`GameSession::execute`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Mulligan {
+    /// Identifier of the match being played; must name the match this session
+    /// records.
+    pub match_id: String,
+    /// Identity of the player performing the redraw; must name one of this
+    /// session's configured Outfits, and it must be that player's turn.
+    pub player_id: String,
+    /// The card identities the player is redrawing. May be empty (the player
+    /// keeps their whole hand); every id present must be non-blank and distinct,
+    /// and there cannot be more of them than the player's deck can replace.
+    pub card_ids_to_redraw: Vec<String>,
+}
+
+impl Mulligan {
+    /// The command name this maps to.
+    pub const COMMAND: &'static str = MULLIGAN;
+
+    /// Build a `MulliganCmd` for `player_id` in `match_id`, redrawing
+    /// `card_ids_to_redraw`.
+    pub fn new(
+        match_id: impl Into<String>,
+        player_id: impl Into<String>,
+        card_ids_to_redraw: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Self {
+        Self {
+            match_id: match_id.into(),
+            player_id: player_id.into(),
+            card_ids_to_redraw: card_ids_to_redraw.into_iter().map(Into::into).collect(),
+        }
+    }
+
+    /// Encode this command as a [`shared::Command`] carrying a JSON payload,
+    /// ready to hand to [`GameSession::execute`].
+    pub fn into_command(&self) -> Command {
+        // Serialization of a plain data struct to a Vec cannot fail here.
+        let payload = serde_json::to_vec(self).expect("Mulligan is always serializable");
+        Command::with_payload(Self::COMMAND, payload)
+    }
+}
+
 /// The started match, carried by [`Event::MatchStarted`] and thus by the emitted
 /// `match.started` event.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -183,17 +241,34 @@ pub struct MatchStarted {
     pub opening_player: Player,
 }
 
+/// A completed opening-hand redraw, carried by [`Event::MulliganCompleted`] and
+/// thus by the emitted `mulligan.completed` event.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MulliganCompleted {
+    /// The match the redraw happened in.
+    pub match_id: String,
+    /// The player identity that redrew.
+    pub player_id: String,
+    /// The seat that player occupies.
+    pub player: Player,
+    /// The card identities that were redrawn (in the order submitted).
+    pub redrawn_card_ids: Vec<String>,
+}
+
 /// Domain events emitted by [`GameSession`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Event {
     /// A match passed every start-time invariant and was initialized.
     MatchStarted(MatchStarted),
+    /// A player's opening-hand redraw passed every invariant and was applied.
+    MulliganCompleted(MulliganCompleted),
 }
 
 impl DomainEvent for Event {
     fn event_type(&self) -> &'static str {
         match self {
             Event::MatchStarted(_) => "match.started",
+            Event::MulliganCompleted(_) => "mulligan.completed",
         }
     }
 }
@@ -451,6 +526,114 @@ impl GameSession {
         self.root.record(Box::new(event.clone()));
         Ok(vec![event])
     }
+
+    /// Resolve a player identity to the seat it occupies, rejecting an identity
+    /// that names neither configured Outfit.
+    fn seat_for_player(&self, player_id: &str) -> Result<Player, DomainError> {
+        if player_id == self.player_a.name {
+            Ok(Player::A)
+        } else if player_id == self.player_b.name {
+            Ok(Player::B)
+        } else {
+            Err(DomainError::InvariantViolation(format!(
+                "player '{player_id}' names neither configured Outfit ('{}', '{}')",
+                self.player_a.name, self.player_b.name
+            )))
+        }
+    }
+
+    /// The opening Outfit seated at `seat`.
+    fn outfit_at(&self, seat: Player) -> &OutfitConfig {
+        match seat {
+            Player::A => &self.player_a,
+            Player::B => &self.player_b,
+        }
+    }
+
+    /// Redraw-selection invariant: every card id must be non-blank and distinct,
+    /// and a player cannot redraw more cards than their deck can replace — drawing
+    /// past the deck deals Fatigue instead of yielding a card.
+    fn ensure_redraw_selection_valid(
+        &self,
+        seat: Player,
+        card_ids: &[String],
+    ) -> Result<(), DomainError> {
+        for id in card_ids {
+            if id.trim().is_empty() {
+                return Err(DomainError::InvariantViolation(
+                    "cardIdsToRedraw contains a blank card id".to_string(),
+                ));
+            }
+        }
+        let mut seen = card_ids.to_vec();
+        seen.sort();
+        seen.dedup();
+        if seen.len() != card_ids.len() {
+            return Err(DomainError::InvariantViolation(
+                "cardIdsToRedraw contains duplicate card ids; each redrawn card must be distinct"
+                    .to_string(),
+            ));
+        }
+        let deck_size = self.outfit_at(seat).deck_size;
+        if card_ids.len() > deck_size {
+            return Err(DomainError::InvariantViolation(format!(
+                "redraw of {} card(s) exceeds the {} card(s) available in the deck; drawing past an empty deck deals Fatigue instead of a card",
+                card_ids.len(),
+                deck_size
+            )));
+        }
+        Ok(())
+    }
+
+    /// Handle `MulliganCmd`: verify the command targets this match and a real
+    /// player, validate the redraw selection, enforce every match-play invariant
+    /// against the session's opening state, confirm it is the redrawing player's
+    /// turn, and emit [`Event::MulliganCompleted`].
+    fn mulligan(&mut self, cmd: Mulligan) -> Result<Vec<Event>, DomainError> {
+        // The command must name the match this session actually records.
+        if cmd.match_id != self.match_id {
+            return Err(DomainError::InvariantViolation(format!(
+                "command targets match '{}' but this session records '{}'",
+                cmd.match_id, self.match_id
+            )));
+        }
+        // A player must be named, and it must be one of the configured Outfits.
+        if cmd.player_id.trim().is_empty() {
+            return Err(DomainError::InvariantViolation(
+                "a playerId must be provided".to_string(),
+            ));
+        }
+        let seat = self.seat_for_player(&cmd.player_id)?;
+
+        // The redraw selection itself must be well-formed.
+        self.ensure_redraw_selection_valid(seat, &cmd.card_ids_to_redraw)?;
+
+        // Enforce every match-play invariant before applying the redraw.
+        self.ensure_boards_within_caps()?;
+        self.ensure_heat_within_bounds()?;
+        self.ensure_starting_juice_valid()?;
+        self.ensure_decks_nonempty()?;
+        self.ensure_heists_prereqs_satisfied()?;
+        self.ensure_bosses_alive()?;
+        let turn_player = self.ensure_opening_player_designated()?;
+
+        // Turn-ownership: a mulligan is valid only for the player whose turn it is.
+        if seat != turn_player {
+            return Err(DomainError::InvariantViolation(format!(
+                "player '{}' (seat {seat:?}) may not mulligan; it is player {turn_player:?}'s turn",
+                cmd.player_id
+            )));
+        }
+
+        let event = Event::MulliganCompleted(MulliganCompleted {
+            match_id: cmd.match_id,
+            player_id: cmd.player_id,
+            player: seat,
+            redrawn_card_ids: cmd.card_ids_to_redraw,
+        });
+        self.root.record(Box::new(event.clone()));
+        Ok(vec![event])
+    }
 }
 
 impl Aggregate for GameSession {
@@ -467,6 +650,12 @@ impl Aggregate for GameSession {
                     DomainError::InvariantViolation(format!("malformed StartMatchCmd payload: {e}"))
                 })?;
                 self.start_match(cmd)
+            }
+            MULLIGAN => {
+                let cmd: Mulligan = serde_json::from_slice(&command.payload).map_err(|e| {
+                    DomainError::InvariantViolation(format!("malformed MulliganCmd payload: {e}"))
+                })?;
+                self.mulligan(cmd)
             }
             // Any other command is unknown to this aggregate.
             _ => Err(DomainError::unknown_command(
@@ -542,6 +731,7 @@ mod tests {
                 assert_eq!(started.rng_seed, 0xC0FFEE);
                 assert_eq!(started.opening_player, Player::A);
             }
+            other => panic!("expected MatchStarted, got {other:?}"),
         }
         // The event was recorded on the aggregate root.
         assert_eq!(session.version(), 1);
@@ -718,5 +908,245 @@ mod tests {
         assert_eq!(command.name, StartMatch::COMMAND);
         let decoded: StartMatch = serde_json::from_slice(&command.payload).unwrap();
         assert_eq!(decoded, valid_cmd());
+    }
+
+    // ---- MulliganCmd (S-3) --------------------------------------------------
+
+    /// A legal `MulliganCmd` for `m-1`: the turn-holding player `A` redraws two
+    /// distinct cards. Tests mutate one aspect at a time to drive a rejection.
+    fn valid_mulligan() -> Mulligan {
+        Mulligan::new("m-1", "m-1-a", ["card-1", "card-2"])
+    }
+
+    // Scenario: Successfully execute MulliganCmd.
+    #[test]
+    fn applies_mulligan_and_emits_mulligan_completed_event() {
+        let mut session = valid_session();
+
+        let events = session
+            .execute(valid_mulligan().into_command())
+            .expect("a valid mulligan should succeed");
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_type(), "mulligan.completed");
+        match &events[0] {
+            Event::MulliganCompleted(done) => {
+                assert_eq!(done.match_id, "m-1");
+                assert_eq!(done.player_id, "m-1-a");
+                assert_eq!(done.player, Player::A);
+                assert_eq!(done.redrawn_card_ids, vec!["card-1", "card-2"]);
+            }
+            other => panic!("expected MulliganCompleted, got {other:?}"),
+        }
+        assert_eq!(session.version(), 1);
+        assert_eq!(session.uncommitted_events().len(), 1);
+        assert_eq!(
+            session.uncommitted_events()[0].event_type(),
+            "mulligan.completed"
+        );
+    }
+
+    // A redraw of zero cards (keep the whole hand) is a legal mulligan.
+    #[test]
+    fn applies_empty_mulligan_keeping_the_hand() {
+        let mut session = valid_session();
+        let events = session
+            .execute(Mulligan::new("m-1", "m-1-a", Vec::<String>::new()).into_command())
+            .expect("keeping the whole hand is a valid mulligan");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_type(), "mulligan.completed");
+        assert_eq!(session.version(), 1);
+    }
+
+    // Scenario: rejected — Juice starts at 1 (hard-capped at 10).
+    #[test]
+    fn mulligan_rejects_when_starting_juice_is_not_one() {
+        let mut session = valid_session();
+        let mut outfit = OutfitConfig::new("m-1-a");
+        outfit.starting_juice = 3;
+        session.configure_player_a(outfit);
+
+        let err = session
+            .execute(valid_mulligan().into_command())
+            .expect_err("an illegal opening Juice must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(session.version(), 0);
+    }
+
+    // Scenario: rejected — a board may hold at most 7 Operators and 3 Vehicles.
+    #[test]
+    fn mulligan_rejects_when_board_exceeds_operator_cap() {
+        let mut session = valid_session();
+        let mut outfit = OutfitConfig::new("m-1-a");
+        outfit.operators = MAX_OPERATORS + 1;
+        session.configure_player_a(outfit);
+
+        let err = session
+            .execute(valid_mulligan().into_command())
+            .expect_err("an over-capacity board must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(session.version(), 0);
+    }
+
+    #[test]
+    fn mulligan_rejects_when_board_exceeds_vehicle_cap() {
+        let mut session = valid_session();
+        let mut outfit = OutfitConfig::new("m-1-b");
+        outfit.vehicles = MAX_VEHICLES + 1;
+        session.configure_player_b(outfit);
+
+        let err = session
+            .execute(valid_mulligan().into_command())
+            .expect_err("an over-capacity vehicle board must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(session.version(), 0);
+    }
+
+    // Scenario: rejected — Heat is bounded 0..10 and no state may leave it.
+    #[test]
+    fn mulligan_rejects_when_heat_leaves_bounds() {
+        let mut session = valid_session();
+        let mut outfit = OutfitConfig::new("m-1-a");
+        outfit.starting_heat = *HEAT_BOUNDS.end() + 1;
+        session.configure_player_a(outfit);
+
+        let err = session
+            .execute(valid_mulligan().into_command())
+            .expect_err("Heat outside its bounds must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(session.version(), 0);
+    }
+
+    // Scenario: rejected — a Heist resolves only after its prerequisite queue is
+    // satisfied.
+    #[test]
+    fn mulligan_rejects_when_heist_resolved_with_outstanding_prereqs() {
+        let mut session = valid_session();
+        let mut outfit = OutfitConfig::new("m-1-a");
+        outfit.heist_resolved = true;
+        outfit.outstanding_heist_prereqs = 2;
+        session.configure_player_a(outfit);
+
+        let err = session
+            .execute(valid_mulligan().into_command())
+            .expect_err("a Heist resolved with outstanding prereqs must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(session.version(), 0);
+    }
+
+    // Scenario: rejected — drawing from an empty deck deals Fatigue instead of a
+    // card, so a match may not carry a deckless Outfit.
+    #[test]
+    fn mulligan_rejects_when_deck_is_empty() {
+        let mut session = valid_session();
+        let mut outfit = OutfitConfig::new("m-1-b");
+        outfit.deck_size = 0;
+        session.configure_player_b(outfit);
+
+        let err = session
+            .execute(valid_mulligan().into_command())
+            .expect_err("an empty deck must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(session.version(), 0);
+    }
+
+    // A redraw cannot ask for more cards than the deck can replace (drawing past
+    // an empty deck deals Fatigue instead of a card).
+    #[test]
+    fn mulligan_rejects_when_redraw_exceeds_deck() {
+        let mut session = valid_session();
+        let mut outfit = OutfitConfig::new("m-1-a");
+        outfit.deck_size = 1;
+        session.configure_player_a(outfit);
+
+        let err = session
+            .execute(Mulligan::new("m-1", "m-1-a", ["c1", "c2"]).into_command())
+            .expect_err("redrawing more cards than the deck can replace must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(session.version(), 0);
+    }
+
+    // Scenario: rejected — a command is valid only for the player whose turn it
+    // currently is; a mulligan by the off-turn player is rejected.
+    #[test]
+    fn mulligan_rejects_when_not_the_players_turn() {
+        let mut session = valid_session();
+        // Player A holds the turn; player B tries to mulligan.
+        let err = session
+            .execute(Mulligan::new("m-1", "m-1-b", ["card-1"]).into_command())
+            .expect_err("an off-turn mulligan must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(session.version(), 0);
+    }
+
+    // A turn-less setup is likewise ill-formed for a mulligan.
+    #[test]
+    fn mulligan_rejects_when_no_opening_player_is_designated() {
+        let mut session = valid_session();
+        session.set_opening_player(None);
+
+        let err = session
+            .execute(valid_mulligan().into_command())
+            .expect_err("a turn-less setup must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(session.version(), 0);
+    }
+
+    // Scenario: rejected — a match ends the instant a Boss's HP reaches 0 or
+    // below, so a defeated Boss cannot be carried into a mulligan.
+    #[test]
+    fn mulligan_rejects_when_a_boss_is_defeated() {
+        let mut session = valid_session();
+        let mut outfit = OutfitConfig::new("m-1-a");
+        outfit.boss_hp = 0;
+        session.configure_player_a(outfit);
+
+        let err = session
+            .execute(valid_mulligan().into_command())
+            .expect_err("a defeated Boss must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(session.version(), 0);
+    }
+
+    // A mulligan must name the match this session records.
+    #[test]
+    fn mulligan_rejects_when_command_targets_a_different_match() {
+        let mut session = valid_session();
+        let err = session
+            .execute(Mulligan::new("other-match", "m-1-a", ["card-1"]).into_command())
+            .expect_err("a mismatched match id must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(session.version(), 0);
+    }
+
+    // A mulligan must name a configured Outfit.
+    #[test]
+    fn mulligan_rejects_unknown_player() {
+        let mut session = valid_session();
+        let err = session
+            .execute(Mulligan::new("m-1", "ghost", ["card-1"]).into_command())
+            .expect_err("an unknown player must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(session.version(), 0);
+    }
+
+    // A redraw selection must not contain duplicate card ids.
+    #[test]
+    fn mulligan_rejects_duplicate_card_ids() {
+        let mut session = valid_session();
+        let err = session
+            .execute(Mulligan::new("m-1", "m-1-a", ["dup", "dup"]).into_command())
+            .expect_err("duplicate card ids must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(session.version(), 0);
+    }
+
+    #[test]
+    fn mulligan_command_payload_round_trips() {
+        let cmd = valid_mulligan();
+        let command = cmd.into_command();
+        assert_eq!(command.name, Mulligan::COMMAND);
+        let decoded: Mulligan = serde_json::from_slice(&command.payload).unwrap();
+        assert_eq!(decoded, valid_mulligan());
     }
 }
