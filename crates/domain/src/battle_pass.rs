@@ -67,6 +67,9 @@ pub struct ClaimPassReward {
     pub tier: u32,
 }
 
+/// Story-facing alias for the `ClaimPassRewardCmd` payload type.
+pub type ClaimPassRewardCmd = ClaimPassReward;
+
 impl ClaimPassReward {
     /// The command name this maps to.
     pub const COMMAND: &'static str = CLAIM_PASS_REWARD;
@@ -108,6 +111,9 @@ pub struct PurchaseBattlePass {
     /// The fiat Order that paid for the premium track; must be non-empty.
     pub order_id: String,
 }
+
+/// Story-facing alias for the `PurchaseBattlePassCmd` payload type.
+pub type PurchaseBattlePassCmd = PurchaseBattlePass;
 
 impl PurchaseBattlePass {
     /// The command name this maps to.
