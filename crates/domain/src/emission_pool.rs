@@ -1,22 +1,31 @@
-//! EmissionPool bounded context - the $MADE reward pool that seasons draw down,
-//! and its low-pool early-warning signal, in the token-and-marketplace context.
+//! EmissionPool bounded context — the per-season $MADE reward pool that a
+//! season opens with a starting balance, draws down as it emits rewards, and
+//! guards with a low-pool early-warning signal, in the token-and-marketplace
+//! context.
 //!
-//! An [`EmissionPool`] holds the season's $MADE reward budget, emits rewards to
-//! recipients within its remaining balance, and raises a low-pool warning ahead
-//! of exhaustion. Four invariants govern whether either operation is allowed:
+//! An [`EmissionPool`] opens a competitive season's reward pool with its
+//! starting balance, emits $MADE rewards to recipients within its remaining
+//! balance, and raises a low-pool warning ahead of exhaustion. Four invariants
+//! govern opening a pool, emitting from it, and warning on it:
 //!
-//! 1. **Emission schedule** - Season 1 opens with a 30M pool and each subsequent
-//!    season's pool follows the mandated halving schedule; a pool whose schedule
-//!    does not match is rejected.
-//! 2. **Balance ceiling** - the pool can never emit more than its remaining
-//!    balance; an emission that would overdraw the pool, or a warning raised on
-//!    an insolvent pool, is rejected.
-//! 3. **Low-pool warning** - the 50% low-pool warning must be raised at 80%
-//!    depletion (advance notice), not at exhaustion; a pool whose warning
-//!    threshold is misconfigured is rejected.
-//! 4. **Governance gating** - pool size is a governance-adjustable parameter and
-//!    a later season cannot open until the prior season's drain is understood; a
-//!    pool whose governance gate is unresolved is rejected.
+//! 1. **Emission schedule** — Season 1 opens with a 30M pool; each subsequent
+//!    season's pool decays by 5% of the prior schedule. A pool whose schedule
+//!    does not encode exactly that shape is rejected.
+//! 2. **Solvency / balance ceiling** — the pool can never emit more than its
+//!    remaining balance; an emission (or a pool configured to over-emit) that
+//!    would overdraw the pool, or a warning raised on an insolvent pool, is
+//!    rejected.
+//! 3. **Advance low-pool warning** — the 50% low-pool warning must be raised at
+//!    80% depletion (advance notice), not at exhaustion; a pool whose warning is
+//!    misconfigured is rejected.
+//! 4. **Governance sequencing** — pool size is a governance-adjustable
+//!    parameter, and a season cannot open (nor emit) until the prior season's
+//!    drain is understood; a pool whose governance gate is unresolved is
+//!    rejected.
+//!
+//! [`OpenEmissionPoolCmd`] (`OpenEmissionPoolCmd`) validates the seasonId and
+//! startingBalance, enforces every invariant, and on success emits
+//! [`Event::PoolOpened`] (`emission.pool.opened`).
 //!
 //! [`EmitRewardCmd`] (`EmitRewardCmd`) validates the poolId, recipientId, and
 //! amount, enforces every invariant, deducts the emitted amount from the
@@ -36,6 +45,10 @@ use shared::{Aggregate, AggregateRoot, Command, DomainError, DomainEvent, Reposi
 /// used for command routing.
 const AGGREGATE_TYPE: &str = "EmissionPool";
 
+/// The command name [`EmissionPool::execute`] recognizes to open a season's
+/// emission pool with its starting balance.
+const OPEN_EMISSION_POOL: &str = "OpenEmissionPoolCmd";
+
 /// The command name [`EmissionPool::execute`] recognizes to emit $MADE from the
 /// pool to a recipient.
 const EMIT_REWARD: &str = "EmitRewardCmd";
@@ -44,9 +57,98 @@ const EMIT_REWARD: &str = "EmitRewardCmd";
 /// low-pool warning at 80% depletion.
 const RAISE_LOW_POOL_WARNING: &str = "RaiseLowPoolWarningCmd";
 
-/// The $MADE balance Season 1's pool opens with (30M base units). A freshly
-/// constructed [`EmissionPool`] starts fully funded at this amount.
+/// The Season 1 pool size, in $MADE base units: the schedule opens at 30M and
+/// decays each subsequent season. A freshly constructed [`EmissionPool`] starts
+/// fully funded at this amount.
 const SEASON_ONE_POOL: u64 = 30_000_000;
+
+/// The per-season decay applied to the emission schedule, in basis points
+/// (1 bp = 0.01%). Each subsequent season's pool is 5% (500 bps) smaller than
+/// the prior schedule.
+const SCHEDULE_DECAY_BPS: u32 = 500;
+
+/// The emission schedule a pool follows. Field names use the token
+/// marketplace's `camelCase` schema.
+///
+/// The canonical schedule opens Season 1 at a 30M pool and decays each
+/// subsequent season by 5% of the prior schedule. A schedule is only
+/// [`EmissionSchedule::is_canonical`] when it encodes exactly that shape.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EmissionSchedule {
+    /// The Season 1 pool size, in $MADE base units.
+    pub season_one_pool: u64,
+    /// The per-season decay of the schedule, in basis points.
+    pub decay_bps: u32,
+}
+
+impl EmissionSchedule {
+    /// The canonical schedule: Season 1 opens at 30M, decaying 5% per season.
+    pub const fn canonical() -> Self {
+        Self {
+            season_one_pool: SEASON_ONE_POOL,
+            decay_bps: SCHEDULE_DECAY_BPS,
+        }
+    }
+
+    /// Build an emission schedule from an explicit Season 1 pool and decay.
+    pub fn new(season_one_pool: u64, decay_bps: u32) -> Self {
+        Self {
+            season_one_pool,
+            decay_bps,
+        }
+    }
+
+    /// Whether this schedule encodes exactly the canonical 30M / 5%-decay shape.
+    fn is_canonical(&self) -> bool {
+        *self == Self::canonical()
+    }
+}
+
+impl Default for EmissionSchedule {
+    fn default() -> Self {
+        Self::canonical()
+    }
+}
+
+/// The `OpenEmissionPoolCmd` payload: which season's pool to open and the
+/// starting balance to open it with. Field names use the token marketplace's
+/// `camelCase` schema.
+///
+/// Build one directly and turn it into a [`Command`] with
+/// [`OpenEmissionPoolCmd::into_command`], or decode it from a command payload
+/// via [`serde_json`] inside [`EmissionPool::execute`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OpenEmissionPoolCmd {
+    /// The season whose pool is being opened; must be a valid, non-empty
+    /// identifier.
+    pub season_id: String,
+    /// The starting balance the pool opens with, in $MADE base units; must be
+    /// positive.
+    pub starting_balance: u64,
+}
+
+impl OpenEmissionPoolCmd {
+    /// The command name this maps to.
+    pub const COMMAND: &'static str = OPEN_EMISSION_POOL;
+
+    /// Build a command opening `season_id`'s pool with `starting_balance`.
+    pub fn new(season_id: impl Into<String>, starting_balance: u64) -> Self {
+        Self {
+            season_id: season_id.into(),
+            starting_balance,
+        }
+    }
+
+    /// Encode this command as a [`shared::Command`] carrying a JSON payload,
+    /// ready to hand to [`EmissionPool::execute`].
+    pub fn into_command(&self) -> Command {
+        // Serialization of a plain data struct to a Vec cannot fail here.
+        let payload = serde_json::to_vec(self).expect("OpenEmissionPoolCmd is always serializable");
+        Command::with_payload(Self::COMMAND, payload)
+    }
+}
 
 /// The `EmitRewardCmd` payload: which pool to draw from, who receives the
 /// reward, and how much $MADE to emit. Field names use the token marketplace's
@@ -128,6 +230,18 @@ impl RaiseLowPoolWarningCmd {
     }
 }
 
+/// The pool that was opened, carried by [`Event::PoolOpened`] and thus by the
+/// emitted `emission.pool.opened` event.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PoolOpened {
+    /// The season whose pool was opened.
+    pub season_id: String,
+    /// The starting balance the pool opened with, in $MADE base units.
+    pub starting_balance: u64,
+    /// The emission schedule the opened pool follows.
+    pub emission_schedule: EmissionSchedule,
+}
+
 /// The reward that was emitted, carried by [`Event::RewardEmitted`] and thus by
 /// the emitted `reward.emitted` event.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -156,6 +270,8 @@ pub struct LowPoolWarningRaised {
 /// Domain events emitted by [`EmissionPool`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Event {
+    /// A season's emission pool was opened with its starting balance.
+    PoolOpened(PoolOpened),
     /// $MADE was emitted from the pool to a recipient.
     RewardEmitted(RewardEmitted),
     /// The 50% low-pool warning was raised at 80% depletion.
@@ -165,28 +281,41 @@ pub enum Event {
 impl DomainEvent for Event {
     fn event_type(&self) -> &'static str {
         match self {
+            Event::PoolOpened(_) => "emission.pool.opened",
             Event::RewardEmitted(_) => "reward.emitted",
             Event::LowPoolWarningRaised(_) => "low.pool.warning.raised",
         }
     }
 }
 
-/// The EmissionPool aggregate: the $MADE reward budget a season draws down, and
-/// its low-pool early-warning signal.
+/// The EmissionPool aggregate: one season's $MADE emission pool — the reward
+/// budget a season opens with, draws down, and guards with a low-pool warning.
 ///
 /// Mirrors the shape produced by [`shared::stub_aggregate!`] (identity plus an
 /// embedded [`AggregateRoot`]) so surrounding wiring stays consistent, while it
-/// carries the state its commands validate: the remaining balance, whether the
-/// emission schedule matches the mandated halving, whether the low-pool warning
-/// threshold is configured, and whether the governance gate is resolved.
+/// carries the state [`OpenEmissionPoolCmd`], [`EmitRewardCmd`], and
+/// [`RaiseLowPoolWarningCmd`] validate: the emission schedule the pool follows,
+/// the remaining balance, and the configuration flags that model whether the
+/// pool over-emits, warns in advance, and has resolved its governance gate.
 #[derive(Debug)]
 pub struct EmissionPool {
     id: String,
     root: AggregateRoot,
+    /// The emission schedule the pool follows; must be the canonical 30M /
+    /// 5%-decay schedule.
+    emission_schedule: EmissionSchedule,
     /// The $MADE remaining in the pool; an emission may never exceed it.
     remaining_balance: u64,
+    /// Whether the pool can only ever emit within its remaining balance.
+    emits_within_balance: bool,
+    /// Whether the low-pool warning is raised at 80% depletion (advance
+    /// notice), rather than only at exhaustion.
+    low_pool_warning_in_advance: bool,
+    /// Whether the prior season's drain is understood, gating this season's
+    /// open and any emission from it.
+    prior_season_drain_understood: bool,
     /// Whether the pool's emission schedule matches the mandated season
-    /// schedule (Season 1 = 30M, each later season halved per schedule).
+    /// schedule (Season 1 = 30M, each later season decayed per schedule).
     emission_schedule_valid: bool,
     /// Whether the low-pool warning is configured to raise at 80% depletion
     /// (advance notice), rather than at exhaustion.
@@ -197,15 +326,20 @@ pub struct EmissionPool {
 }
 
 impl EmissionPool {
-    /// Create a new, emission-ready EmissionPool identified by `id`: fully funded
-    /// at the Season 1 pool of 30M $MADE, with a valid emission schedule, a
-    /// correctly configured low-pool warning, and a resolved governance gate. Use
-    /// the configuration methods to drive it to the state a command validates.
+    /// Create a new, ready EmissionPool identified by `id`: fully funded at the
+    /// Season 1 pool of 30M $MADE, following the canonical emission schedule,
+    /// only emitting within its remaining balance, raising its low-pool warning
+    /// in advance, and with the prior season's drain understood. Use the
+    /// configuration methods to drive it to the state a command validates.
     pub fn new(id: impl Into<String>) -> Self {
         Self {
             id: id.into(),
             root: AggregateRoot::new(),
+            emission_schedule: EmissionSchedule::canonical(),
             remaining_balance: SEASON_ONE_POOL,
+            emits_within_balance: true,
+            low_pool_warning_in_advance: true,
+            prior_season_drain_understood: true,
             emission_schedule_valid: true,
             low_pool_warning_valid: true,
             governance_schedule_valid: true,
@@ -238,9 +372,33 @@ impl EmissionPool {
         self.remaining_balance = balance;
     }
 
+    /// Set the emission schedule the pool follows (a non-canonical schedule
+    /// models a pool that departs from the mandated 30M / 5%-decay shape).
+    pub fn set_emission_schedule(&mut self, schedule: EmissionSchedule) {
+        self.emission_schedule = schedule;
+    }
+
+    /// Record whether the pool only emits within its remaining balance
+    /// (`false` models a pool that would over-emit).
+    pub fn set_emits_within_balance(&mut self, within: bool) {
+        self.emits_within_balance = within;
+    }
+
+    /// Record whether the low-pool warning is raised in advance at 80%
+    /// depletion (`false` models a pool that would warn only at exhaustion).
+    pub fn set_low_pool_warning_in_advance(&mut self, in_advance: bool) {
+        self.low_pool_warning_in_advance = in_advance;
+    }
+
+    /// Record whether the prior season's drain is understood (`false` models a
+    /// season opened before the prior season's drain is understood).
+    pub fn set_prior_season_drain_understood(&mut self, understood: bool) {
+        self.prior_season_drain_understood = understood;
+    }
+
     /// Record whether the pool's emission schedule matches the mandated season
     /// schedule (`false` models a pool whose schedule diverges from the 30M
-    /// Season 1 / halving progression).
+    /// Season 1 / decay progression).
     pub fn set_emission_schedule_valid(&mut self, valid: bool) {
         self.emission_schedule_valid = valid;
     }
@@ -258,13 +416,69 @@ impl EmissionPool {
         self.governance_schedule_valid = valid;
     }
 
+    // -- OpenEmissionPoolCmd invariants ------------------------------------
+
+    /// Schedule invariant: Season 1 opens with a 30M pool, and each subsequent
+    /// season's pool decays by 5% of the prior schedule.
+    fn ensure_canonical_schedule(&self) -> Result<(), DomainError> {
+        if !self.emission_schedule.is_canonical() {
+            return Err(DomainError::InvariantViolation(format!(
+                "emission pool '{}' schedule does not follow the mandated shape (Season 1 opens \
+                 with a 30M pool; each subsequent season decays by 5% of the prior schedule)",
+                self.id
+            )));
+        }
+        Ok(())
+    }
+
+    /// Solvency invariant: the pool can never emit more than its remaining
+    /// balance.
+    fn ensure_emits_within_balance(&self) -> Result<(), DomainError> {
+        if !self.emits_within_balance {
+            return Err(DomainError::InvariantViolation(format!(
+                "emission pool '{}' would emit more than its remaining balance; the pool can \
+                 never emit more than its remaining balance",
+                self.id
+            )));
+        }
+        Ok(())
+    }
+
+    /// Warning invariant: the low-pool warning must be raised at 80% depletion
+    /// (advance notice), not at exhaustion.
+    fn ensure_low_pool_warning_in_advance(&self) -> Result<(), DomainError> {
+        if !self.low_pool_warning_in_advance {
+            return Err(DomainError::InvariantViolation(format!(
+                "emission pool '{}' would raise the low-pool warning only at exhaustion; the \
+                 warning must be raised at 80% depletion as advance notice",
+                self.id
+            )));
+        }
+        Ok(())
+    }
+
+    /// Governance sequencing invariant: a season cannot open until the prior
+    /// season's drain is understood.
+    fn ensure_prior_season_drain_understood(&self) -> Result<(), DomainError> {
+        if !self.prior_season_drain_understood {
+            return Err(DomainError::InvariantViolation(format!(
+                "emission pool '{}' cannot open until the prior season's drain is understood; \
+                 pool size is a governance-adjustable parameter set from that understanding",
+                self.id
+            )));
+        }
+        Ok(())
+    }
+
+    // -- EmitRewardCmd invariants ------------------------------------------
+
     /// Emission-schedule invariant: Season 1 opens with a 30M pool and each
-    /// subsequent season's pool follows the mandated halving schedule.
+    /// subsequent season's pool follows the mandated decay schedule.
     fn ensure_emission_schedule_valid(&self) -> Result<(), DomainError> {
         if !self.emission_schedule_valid {
             return Err(DomainError::InvariantViolation(format!(
                 "emission pool '{}' emission schedule does not match the mandated season \
-                 schedule (Season 1 opens with a 30M pool; each subsequent season halves per \
+                 schedule (Season 1 opens with a 30M pool; each subsequent season decays per \
                  the prior schedule)",
                 self.id
             )));
@@ -312,8 +526,8 @@ impl EmissionPool {
         Ok(())
     }
 
-    /// Governance invariant: pool size is a governance-adjustable parameter and a
-    /// later season cannot open until the prior season's drain is understood.
+    /// Governance invariant: pool size is a governance-adjustable parameter and
+    /// a later season cannot open until the prior season's drain is understood.
     fn ensure_governance_schedule_valid(&self) -> Result<(), DomainError> {
         if !self.governance_schedule_valid {
             return Err(DomainError::InvariantViolation(format!(
@@ -324,6 +538,39 @@ impl EmissionPool {
             )));
         }
         Ok(())
+    }
+
+    // -- Command handlers --------------------------------------------------
+
+    /// Handle `OpenEmissionPoolCmd`: verify the command carries a valid seasonId
+    /// and startingBalance; enforce every emission-pool invariant; and emit
+    /// [`Event::PoolOpened`].
+    fn open_emission_pool(&mut self, cmd: OpenEmissionPoolCmd) -> Result<Vec<Event>, DomainError> {
+        if cmd.season_id.trim().is_empty() {
+            return Err(DomainError::InvariantViolation(format!(
+                "emission pool '{}' requires a valid seasonId to open the pool",
+                self.id
+            )));
+        }
+        if cmd.starting_balance == 0 {
+            return Err(DomainError::InvariantViolation(format!(
+                "emission pool '{}' requires a positive startingBalance to open the pool",
+                self.id
+            )));
+        }
+
+        self.ensure_canonical_schedule()?;
+        self.ensure_emits_within_balance()?;
+        self.ensure_low_pool_warning_in_advance()?;
+        self.ensure_prior_season_drain_understood()?;
+
+        let event = Event::PoolOpened(PoolOpened {
+            season_id: cmd.season_id,
+            starting_balance: cmd.starting_balance,
+            emission_schedule: self.emission_schedule,
+        });
+        self.root.record(Box::new(event.clone()));
+        Ok(vec![event])
     }
 
     /// Handle `EmitRewardCmd`: verify the command carries a valid poolId (naming
@@ -425,6 +672,15 @@ impl Aggregate for EmissionPool {
 
     fn execute(&mut self, command: Command) -> Result<Vec<Self::Event>, DomainError> {
         match command.name.as_str() {
+            OPEN_EMISSION_POOL => {
+                let cmd: OpenEmissionPoolCmd =
+                    serde_json::from_slice(&command.payload).map_err(|e| {
+                        DomainError::InvariantViolation(format!(
+                            "malformed OpenEmissionPoolCmd payload: {e}"
+                        ))
+                    })?;
+                self.open_emission_pool(cmd)
+            }
             EMIT_REWARD => {
                 let cmd: EmitRewardCmd = serde_json::from_slice(&command.payload).map_err(|e| {
                     DomainError::InvariantViolation(format!("malformed EmitRewardCmd payload: {e}"))
@@ -461,11 +717,18 @@ mod tests {
     /// raised: 80% depletion, not exhaustion (100%).
     const WARNING_DEPLETION_PCT: u8 = 80;
 
-    /// An emission-ready EmissionPool `pool-01`: fully funded at the Season 1
-    /// pool of 30M $MADE, with a valid emission schedule, a correctly configured
-    /// low-pool warning, and a resolved governance gate.
+    /// A ready EmissionPool `pool-01`: fully funded at the Season 1 pool of 30M
+    /// $MADE, following the canonical schedule, only emitting within its
+    /// balance, warning in advance, and with the prior season's drain
+    /// understood and every open- and emit-side gate resolved.
     fn ready_pool() -> EmissionPool {
         let mut pool = EmissionPool::new("pool-01");
+        // Open-side invariants.
+        pool.set_emission_schedule(EmissionSchedule::canonical());
+        pool.set_emits_within_balance(true);
+        pool.set_low_pool_warning_in_advance(true);
+        pool.set_prior_season_drain_understood(true);
+        // Emit-side invariants.
         pool.set_remaining_balance(SEASON_ONE_POOL);
         pool.set_emission_schedule_valid(true);
         pool.set_low_pool_warning_valid(true);
@@ -473,8 +736,14 @@ mod tests {
         pool
     }
 
+    /// A command opening season `2026-summer`'s pool with a 30M starting
+    /// balance.
+    fn valid_open_cmd() -> OpenEmissionPoolCmd {
+        OpenEmissionPoolCmd::new("2026-summer", SEASON_ONE_POOL)
+    }
+
     /// A command emitting 1000 $MADE from `pool-01` to `recipient-7`.
-    fn valid_cmd() -> EmitRewardCmd {
+    fn valid_emit_cmd() -> EmitRewardCmd {
         EmitRewardCmd::new("pool-01", "recipient-7", 1000)
     }
 
@@ -483,13 +752,146 @@ mod tests {
         RaiseLowPoolWarningCmd::new("pool-01", WARNING_DEPLETION_PCT)
     }
 
+    // --- OpenEmissionPoolCmd ---------------------------------------------
+
+    // Scenario: Successfully execute OpenEmissionPoolCmd.
+    #[test]
+    fn opens_and_emits_pool_opened_event() {
+        let mut pool = ready_pool();
+
+        let events = pool
+            .execute(valid_open_cmd().into_command())
+            .expect("valid open should succeed");
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_type(), "emission.pool.opened");
+        match &events[0] {
+            Event::PoolOpened(opened) => {
+                assert_eq!(opened.season_id, "2026-summer");
+                assert_eq!(opened.starting_balance, SEASON_ONE_POOL);
+                assert_eq!(opened.emission_schedule, EmissionSchedule::canonical());
+            }
+            other => panic!("expected PoolOpened, got {other:?}"),
+        }
+        // The EmissionPool recorded the event and advanced its version.
+        assert_eq!(pool.version(), 1);
+        assert_eq!(pool.uncommitted_events().len(), 1);
+        assert_eq!(
+            pool.uncommitted_events()[0].event_type(),
+            "emission.pool.opened"
+        );
+    }
+
+    // Scenario: rejected — Season 1 opens with a 30M pool; each subsequent
+    // season's pool decays by 5% of the prior schedule.
+    #[test]
+    fn rejects_when_schedule_is_not_canonical() {
+        let mut pool = ready_pool();
+        // A schedule that departs from the mandated 30M / 5%-decay shape.
+        pool.set_emission_schedule(EmissionSchedule::new(25_000_000, SCHEDULE_DECAY_BPS));
+
+        let err = pool
+            .execute(valid_open_cmd().into_command())
+            .expect_err("a non-canonical emission schedule must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(pool.version(), 0);
+    }
+
+    // Scenario: rejected — The pool can never emit more than its remaining
+    // balance.
+    #[test]
+    fn rejects_when_pool_would_over_emit() {
+        let mut pool = ready_pool();
+        pool.set_emits_within_balance(false);
+
+        let err = pool
+            .execute(valid_open_cmd().into_command())
+            .expect_err("a pool that would over-emit must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(pool.version(), 0);
+    }
+
+    // Scenario: rejected — The low-pool warning must be raised at 80% depletion
+    // (advance notice), not at exhaustion.
+    #[test]
+    fn rejects_when_warning_is_not_raised_in_advance() {
+        let mut pool = ready_pool();
+        pool.set_low_pool_warning_in_advance(false);
+
+        let err = pool
+            .execute(valid_open_cmd().into_command())
+            .expect_err("a pool that warns only at exhaustion must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(pool.version(), 0);
+    }
+
+    // Scenario: rejected — Pool size is a governance-adjustable parameter;
+    // a season cannot open until the prior season's drain is understood.
+    #[test]
+    fn rejects_when_prior_season_drain_not_understood() {
+        let mut pool = ready_pool();
+        pool.set_prior_season_drain_understood(false);
+
+        let err = pool
+            .execute(valid_open_cmd().into_command())
+            .expect_err("opening before the prior season's drain is understood must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(pool.version(), 0);
+    }
+
+    // Commands missing a required field are rejected.
+    #[test]
+    fn rejects_open_command_with_missing_fields() {
+        // Empty seasonId.
+        let mut pool = ready_pool();
+        let err = pool
+            .execute(OpenEmissionPoolCmd::new("   ", SEASON_ONE_POOL).into_command())
+            .expect_err("a command with an empty seasonId must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(pool.version(), 0);
+
+        // Zero startingBalance.
+        let mut pool = ready_pool();
+        let err = pool
+            .execute(OpenEmissionPoolCmd::new("2026-summer", 0).into_command())
+            .expect_err("a command with a zero startingBalance must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(pool.version(), 0);
+    }
+
+    // A malformed payload for a recognized command is a domain error, not a panic.
+    #[test]
+    fn rejects_malformed_open_emission_pool_payload() {
+        let mut pool = ready_pool();
+
+        let err = pool
+            .execute(Command::with_payload(
+                OPEN_EMISSION_POOL,
+                b"not json".to_vec(),
+            ))
+            .expect_err("malformed payload must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(pool.version(), 0);
+    }
+
+    #[test]
+    fn open_command_payload_round_trips() {
+        let cmd = valid_open_cmd();
+        let command = cmd.into_command();
+        assert_eq!(command.name, OpenEmissionPoolCmd::COMMAND);
+        let decoded: OpenEmissionPoolCmd = serde_json::from_slice(&command.payload).unwrap();
+        assert_eq!(decoded, valid_open_cmd());
+    }
+
+    // --- EmitRewardCmd ---------------------------------------------------
+
     // Scenario: Successfully execute EmitRewardCmd.
     #[test]
     fn emits_and_records_reward_emitted_event() {
         let mut pool = ready_pool();
 
         let events = pool
-            .execute(valid_cmd().into_command())
+            .execute(valid_emit_cmd().into_command())
             .expect("valid emission should succeed");
 
         assert_eq!(events.len(), 1);
@@ -512,14 +914,14 @@ mod tests {
     }
 
     // Scenario: rejected - Season 1 opens with a 30M pool; each subsequent
-    // season's pool halves by the mandated schedule.
+    // season's pool decays by the mandated schedule.
     #[test]
     fn rejects_when_emission_schedule_is_invalid() {
         let mut pool = ready_pool();
         pool.set_emission_schedule_valid(false);
 
         let err = pool
-            .execute(valid_cmd().into_command())
+            .execute(valid_emit_cmd().into_command())
             .expect_err("an invalid emission schedule must be rejected");
         assert!(matches!(err, DomainError::InvariantViolation(_)));
         assert_eq!(pool.version(), 0);
@@ -535,7 +937,7 @@ mod tests {
         pool.set_remaining_balance(500);
 
         let err = pool
-            .execute(valid_cmd().into_command())
+            .execute(valid_emit_cmd().into_command())
             .expect_err("emitting more than the remaining balance must be rejected");
         assert!(matches!(err, DomainError::InvariantViolation(_)));
         assert_eq!(pool.version(), 0);
@@ -550,7 +952,7 @@ mod tests {
         pool.set_low_pool_warning_valid(false);
 
         let err = pool
-            .execute(valid_cmd().into_command())
+            .execute(valid_emit_cmd().into_command())
             .expect_err("a misconfigured low-pool warning must be rejected");
         assert!(matches!(err, DomainError::InvariantViolation(_)));
         assert_eq!(pool.version(), 0);
@@ -564,7 +966,7 @@ mod tests {
         pool.set_governance_schedule_valid(false);
 
         let err = pool
-            .execute(valid_cmd().into_command())
+            .execute(valid_emit_cmd().into_command())
             .expect_err("an unresolved governance gate must be rejected");
         assert!(matches!(err, DomainError::InvariantViolation(_)));
         assert_eq!(pool.version(), 0);
@@ -578,11 +980,13 @@ mod tests {
         pool.set_remaining_balance(1000);
 
         let events = pool
-            .execute(valid_cmd().into_command())
+            .execute(valid_emit_cmd().into_command())
             .expect("emitting exactly the remaining balance should succeed");
         assert_eq!(events.len(), 1);
         assert_eq!(pool.remaining_balance(), 0);
     }
+
+    // --- RaiseLowPoolWarningCmd ------------------------------------------
 
     // Scenario: Successfully execute RaiseLowPoolWarningCmd.
     #[test]
@@ -668,24 +1072,6 @@ mod tests {
         assert_eq!(pool.version(), 0);
     }
 
-    // An unrecognized command is rejected as UnknownCommand naming this aggregate.
-    #[test]
-    fn rejects_unknown_command() {
-        let mut pool = ready_pool();
-
-        let err = pool
-            .execute(Command::new("NoSuchCommand"))
-            .expect_err("unknown command must be rejected");
-        match err {
-            DomainError::UnknownCommand { aggregate, command } => {
-                assert_eq!(aggregate, "EmissionPool");
-                assert_eq!(command, "NoSuchCommand");
-            }
-            other => panic!("expected UnknownCommand, got {other:?}"),
-        }
-        assert_eq!(pool.version(), 0);
-    }
-
     // A command naming a different pool is rejected before any invariant runs.
     #[test]
     fn rejects_command_for_a_different_pool() {
@@ -715,7 +1101,7 @@ mod tests {
 
     // Commands missing any required field are rejected.
     #[test]
-    fn rejects_command_with_missing_fields() {
+    fn rejects_emit_command_with_missing_fields() {
         for cmd in [
             EmitRewardCmd::new("   ", "recipient-7", 1000),
             EmitRewardCmd::new("pool-01", "   ", 1000),
@@ -776,11 +1162,31 @@ mod tests {
 
     #[test]
     fn emit_reward_command_payload_round_trips() {
-        let cmd = valid_cmd();
+        let cmd = valid_emit_cmd();
         let command = cmd.into_command();
         assert_eq!(command.name, EmitRewardCmd::COMMAND);
         let decoded: EmitRewardCmd = serde_json::from_slice(&command.payload).unwrap();
-        assert_eq!(decoded, valid_cmd());
+        assert_eq!(decoded, valid_emit_cmd());
+    }
+
+    // --- Shared -----------------------------------------------------------
+
+    // An unrecognized command is rejected as UnknownCommand naming this aggregate.
+    #[test]
+    fn rejects_unknown_command() {
+        let mut pool = ready_pool();
+
+        let err = pool
+            .execute(Command::new("NoSuchCommand"))
+            .expect_err("unknown command must be rejected");
+        match err {
+            DomainError::UnknownCommand { aggregate, command } => {
+                assert_eq!(aggregate, "EmissionPool");
+                assert_eq!(command, "NoSuchCommand");
+            }
+            other => panic!("expected UnknownCommand, got {other:?}"),
+        }
+        assert_eq!(pool.version(), 0);
     }
 
     #[test]
