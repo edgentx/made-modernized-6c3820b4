@@ -90,6 +90,12 @@ in_memory_repo!(
     domain::matchmaking_ticket::MatchmakingTicketRepository
 );
 in_memory_repo!(
+    /// In-memory adapter for [`domain::mission_attempt::MissionAttemptRepository`].
+    InMemoryMissionAttemptRepository,
+    domain::mission_attempt::MissionAttempt,
+    domain::mission_attempt::MissionAttemptRepository
+);
+in_memory_repo!(
     /// In-memory adapter for [`domain::ranked_standing::RankedStandingRepository`].
     InMemoryRankedStandingRepository,
     domain::ranked_standing::RankedStanding,
@@ -173,6 +179,10 @@ mod tests {
             "MatchmakingTicket"
         );
         assert_unknown!(
+            domain::mission_attempt::MissionAttempt::new("ma"),
+            "MissionAttempt"
+        );
+        assert_unknown!(
             domain::ranked_standing::RankedStanding::new("r"),
             "RankedStanding"
         );
@@ -221,6 +231,11 @@ mod tests {
             &mut InMemoryMatchmakingTicketRepository::new(),
             "t",
             domain::matchmaking_ticket::MatchmakingTicket::new("t"),
+        );
+        round_trip(
+            &mut InMemoryMissionAttemptRepository::new(),
+            "ma",
+            domain::mission_attempt::MissionAttempt::new("ma"),
         );
         round_trip(
             &mut InMemoryRankedStandingRepository::new(),
