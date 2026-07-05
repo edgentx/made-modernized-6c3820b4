@@ -14,13 +14,16 @@
 //! 4. **Reconnect contract** — a reconnecting client is served only events
 //!    *strictly after* its last acknowledged sequence number.
 //!
-//! Two commands are implemented. [`AppendEvent`] (`AppendEventCmd`) signs and
+//! Three commands are implemented. [`AppendEvent`] (`AppendEventCmd`) signs and
 //! appends the next match event at the current sequence number, emitting
 //! [`Event::Appended`] (`event.appended`); it is the only *write* path into the
 //! log and enforces all four invariants before mutating. [`RequestEventsSince`]
 //! (`RequestEventsSinceCmd`) validates all four invariants and, when the
 //! replay is sound, serves the tail of the log and emits [`Event::Resynced`]
-//! (`replay.resynced`). This module is hand-written (it no longer uses
+//! (`replay.resynced`). [`SealReplay`] (`SealReplayCmd`) finalizes a completed
+//! match: it re-checks the same invariants, verifies the caller's final-state
+//! hash reproduces the replayed digest, then freezes the log and emits
+//! [`Event::Sealed`] (`replay.sealed`). This module is hand-written (it no longer uses
 //! `shared::stub_aggregate!`) but preserves the same public surface — a
 //! [`MatchReplay`] aggregate and a [`MatchReplayRepository`] port — so the
 //! persistence adapters in `crates/mocks` keep compiling unchanged.
@@ -64,6 +67,11 @@ pub struct MatchReplay {
     /// The final-state digest that replaying the log from the seed must
     /// reproduce byte-for-byte (the determinism contract).
     expected_final_digest: u64,
+    /// Highest sequence number a reconnecting client has acknowledged. By the
+    /// reconnect contract a client is served only events *strictly after* this,
+    /// so a coherent replay never carries an acknowledgment past its high-water
+    /// mark.
+    acked_sequence: u64,
 }
 
 impl MatchReplay {
@@ -82,6 +90,7 @@ impl MatchReplay {
             sealed_len: 0,
             seed_digest: 0,
             expected_final_digest: 0,
+            acked_sequence: 0,
         }
     }
 
@@ -142,6 +151,13 @@ impl MatchReplay {
         });
         self.expected_final_digest = self.replay_digest();
         Ok(())
+    }
+
+    /// Record that a reconnecting client has acknowledged the log through
+    /// `sequence`. On a future resync it is served only events strictly greater
+    /// than this; the reconnect invariant keeps the value within the log.
+    pub fn acknowledge_through(&mut self, sequence: u64) {
+        self.acked_sequence = sequence;
     }
 
     /// Seal the replay, freezing its current length. After sealing the log is
@@ -271,6 +287,21 @@ impl MatchReplay {
         Ok(vec![event])
     }
 
+    /// Reconnect invariant: a reconnecting client is served only events strictly
+    /// after its last acknowledged sequence, so no acknowledgment may run ahead
+    /// of the log's high-water mark.
+    fn ensure_reconnect_consistent(&self) -> Result<(), DomainError> {
+        let high_water = self.high_water_sequence();
+        if self.acked_sequence > high_water {
+            return Err(DomainError::InvariantViolation(format!(
+                "reconnect contract violated: acknowledged sequence {} is beyond the replay \
+                 high-water mark {high_water}",
+                self.acked_sequence
+            )));
+        }
+        Ok(())
+    }
+
     /// Handle `RequestEventsSinceCmd`: verify the replay is sound, then serve
     /// every event strictly after the client's last acknowledged sequence and
     /// emit [`Event::Resynced`].
@@ -312,6 +343,52 @@ impl MatchReplay {
             match_id: self.match_id.clone(),
             since_sequence: request.last_acked_sequence,
             served_sequences: served,
+        };
+        self.root.record(Box::new(event.clone()));
+        Ok(vec![event])
+    }
+
+    /// Handle `SealReplayCmd`: verify the replay is sound and that the caller's
+    /// final-state hash matches what replaying the log reproduces, then freeze
+    /// the log and emit [`Event::Sealed`].
+    fn seal_replay(&mut self, request: SealReplay) -> Result<Vec<Event>, DomainError> {
+        // The command must name the match this replay actually records.
+        if request.match_id != self.match_id {
+            return Err(DomainError::InvariantViolation(format!(
+                "command targets match '{}' but this replay records '{}'",
+                request.match_id, self.match_id
+            )));
+        }
+
+        // Immutability: a sealed replay is frozen and cannot be resealed.
+        if self.sealed {
+            return Err(DomainError::InvariantViolation(format!(
+                "replay '{}' is already sealed and cannot be resealed",
+                self.id
+            )));
+        }
+
+        // Enforce the standing invariants before freezing the log.
+        self.ensure_ordered()?;
+        self.ensure_deterministic()?;
+        self.ensure_reconnect_consistent()?;
+
+        // Determinism contract: the caller-provided final-state hash must equal
+        // the digest replaying the log from its seed reproduces.
+        let reproduced = self.replay_digest();
+        if request.final_state_hash != reproduced {
+            return Err(DomainError::InvariantViolation(format!(
+                "final state hash {:#x} does not match the replayed digest {reproduced:#x}",
+                request.final_state_hash
+            )));
+        }
+
+        // Freeze the log; the replay is immutable from here on.
+        self.seal();
+        let event = Event::Sealed {
+            match_id: self.match_id.clone(),
+            final_state_hash: reproduced,
+            sealed_sequence: self.high_water_sequence(),
         };
         self.root.record(Box::new(event.clone()));
         Ok(vec![event])
@@ -465,6 +542,68 @@ impl RequestEventsSince {
     }
 }
 
+/// Typed form of the `SealReplayCmd` command.
+///
+/// Finalizes a replay once its match is complete: the caller names the match and
+/// the `finalStateHash` the completed match settled on. As with
+/// [`RequestEventsSince`], the [`shared`] kernel carries commands as opaque
+/// bytes, so this type owns the trivial `"<matchId>:<finalStateHash>"` wire
+/// encoding.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SealReplay {
+    /// The match whose replay is being sealed.
+    pub match_id: String,
+    /// The final `GameSession` state digest the completed match produced; sealing
+    /// verifies replaying the log from its seed reproduces exactly this.
+    pub final_state_hash: u64,
+}
+
+impl SealReplay {
+    /// The command name this maps to.
+    pub const COMMAND: &'static str = "SealReplayCmd";
+
+    /// Build a seal request for `match_id` finalizing at `final_state_hash`.
+    pub fn new(match_id: impl Into<String>, final_state_hash: u64) -> Self {
+        Self {
+            match_id: match_id.into(),
+            final_state_hash,
+        }
+    }
+
+    /// Encode this request as a dispatchable [`Command`].
+    pub fn into_command(self) -> Command {
+        let payload = format!("{}:{}", self.match_id, self.final_state_hash).into_bytes();
+        Command::with_payload(Self::COMMAND, payload)
+    }
+
+    /// Decode a command payload of the form `"<matchId>:<finalStateHash>"`.
+    fn decode(payload: &[u8]) -> Result<Self, DomainError> {
+        let text = std::str::from_utf8(payload).map_err(|_| {
+            DomainError::InvariantViolation("SealReplayCmd payload is not UTF-8".to_string())
+        })?;
+        // Split on the final ':' so a match id may itself contain colons.
+        let (match_id, hash) = text.rsplit_once(':').ok_or_else(|| {
+            DomainError::InvariantViolation(
+                "SealReplayCmd payload must be '<matchId>:<finalStateHash>'".to_string(),
+            )
+        })?;
+        let final_state_hash = hash.parse::<u64>().map_err(|_| {
+            DomainError::InvariantViolation(format!(
+                "SealReplayCmd final state hash '{hash}' is not a valid number"
+            ))
+        })?;
+        if match_id.is_empty() {
+            return Err(DomainError::InvariantViolation(
+                "SealReplayCmd requires a non-empty matchId".to_string(),
+            ));
+        }
+        Ok(Self {
+            match_id: match_id.to_string(),
+            final_state_hash,
+        })
+    }
+}
+
 /// Domain events emitted by [`MatchReplay`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Event {
@@ -487,6 +626,17 @@ pub enum Event {
         /// The sequence numbers served, strictly after `since_sequence`.
         served_sequences: Vec<u64>,
     },
+    /// The replay was sealed after match completion: it names the match, the
+    /// final-state digest the frozen log reproduces, and the high-water sequence
+    /// it was sealed at.
+    Sealed {
+        /// The match whose replay was sealed.
+        match_id: String,
+        /// The final `GameSession` digest the sealed log reproduces from its seed.
+        final_state_hash: u64,
+        /// The high-water sequence the log was frozen at.
+        sealed_sequence: u64,
+    },
 }
 
 impl DomainEvent for Event {
@@ -494,6 +644,7 @@ impl DomainEvent for Event {
         match self {
             Event::Appended { .. } => "event.appended",
             Event::Resynced { .. } => "replay.resynced",
+            Event::Sealed { .. } => "replay.sealed",
         }
     }
 }
@@ -514,6 +665,10 @@ impl Aggregate for MatchReplay {
             RequestEventsSince::COMMAND => {
                 let request = RequestEventsSince::decode(&command.payload)?;
                 self.request_events_since(request)
+            }
+            SealReplay::COMMAND => {
+                let request = SealReplay::decode(&command.payload)?;
+                self.seal_replay(request)
             }
             // Any other command is unknown to this aggregate.
             _ => Err(DomainError::unknown_command(
@@ -773,5 +928,116 @@ mod tests {
         assert_eq!(command.name, RequestEventsSince::COMMAND);
         let decoded = RequestEventsSince::decode(&command.payload).unwrap();
         assert_eq!(decoded, RequestEventsSince::new("m-42", 7));
+    }
+
+    // ---- SealReplayCmd (S-12) --------------------------------------------
+    //
+    // These reuse the shared [`open_replay`] helper above: a sound, still-*open*
+    // replay of three contiguous events for match `m-1`, whose replayed digest is
+    // 7 + 10 + 20 + 30 = 67. `SealReplayCmd` is what freezes it.
+
+    // Scenario: Successfully execute SealReplayCmd.
+    #[test]
+    fn seals_and_emits_replay_sealed_event() {
+        let mut replay = open_replay();
+
+        let events = replay
+            .execute(SealReplay::new("m-1", 67).into_command())
+            .expect("valid seal should succeed");
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_type(), "replay.sealed");
+        match &events[0] {
+            Event::Sealed {
+                match_id,
+                final_state_hash,
+                sealed_sequence,
+            } => {
+                assert_eq!(match_id, "m-1");
+                assert_eq!(*final_state_hash, 67);
+                assert_eq!(*sealed_sequence, 3);
+            }
+            other => panic!("expected Sealed, got {other:?}"),
+        }
+        // The event was recorded on the aggregate root.
+        assert_eq!(replay.uncommitted_events().len(), 1);
+        assert_eq!(replay.version(), 1);
+    }
+
+    // Scenario: rejected — events must be contiguous, monotonically increasing;
+    // no gaps or reorders.
+    #[test]
+    fn seal_rejects_when_log_has_a_gap() {
+        let mut replay = open_replay();
+        // Break contiguity: rewrite the middle sequence (…1, 5, 3…).
+        replay.log[1].sequence = 5;
+
+        let err = replay
+            .execute(SealReplay::new("m-1", 67).into_command())
+            .expect_err("non-contiguous log must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+    }
+
+    // Scenario: rejected — the log is append-only and immutable once written;
+    // sealed replays cannot be mutated.
+    #[test]
+    fn seal_rejects_when_replay_is_already_sealed() {
+        let mut replay = open_replay();
+        // Already frozen: resealing would mutate an immutable replay.
+        replay.seal();
+
+        let err = replay
+            .execute(SealReplay::new("m-1", 67).into_command())
+            .expect_err("resealing a sealed replay must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+    }
+
+    // Scenario: rejected — replaying the log from its seed must reproduce
+    // byte-identical final GameSession state (determinism contract).
+    #[test]
+    fn seal_rejects_when_replay_is_non_deterministic() {
+        let mut replay = open_replay();
+        // Corrupt the expected final digest so replaying no longer reproduces it.
+        replay.expected_final_digest = replay.expected_final_digest.wrapping_add(1);
+
+        let err = replay
+            .execute(SealReplay::new("m-1", 67).into_command())
+            .expect_err("non-deterministic replay must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+    }
+
+    // Scenario: rejected — a reconnecting client is served only events strictly
+    // after its last acknowledged sequence number.
+    #[test]
+    fn seal_rejects_when_acknowledgment_is_beyond_high_water_mark() {
+        let mut replay = open_replay();
+        // A client claims to have acknowledged sequence 9, but the log only
+        // reaches 3 — no honest reconnect could have served past the high-water.
+        replay.acknowledge_through(9);
+
+        let err = replay
+            .execute(SealReplay::new("m-1", 67).into_command())
+            .expect_err("acknowledgment past the high-water mark must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+    }
+
+    // A final-state hash that disagrees with the replayed digest is also a
+    // determinism failure: the caller's claimed outcome is not reproducible.
+    #[test]
+    fn seal_rejects_when_final_state_hash_mismatches() {
+        let mut replay = open_replay();
+
+        let err = replay
+            .execute(SealReplay::new("m-1", 999).into_command())
+            .expect_err("mismatched final state hash must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+    }
+
+    #[test]
+    fn seal_command_payload_round_trips() {
+        let command = SealReplay::new("m-42", 99).into_command();
+        assert_eq!(command.name, SealReplay::COMMAND);
+        let decoded = SealReplay::decode(&command.payload).unwrap();
+        assert_eq!(decoded, SealReplay::new("m-42", 99));
     }
 }
