@@ -21,7 +21,7 @@
 //!    repeated abandonment; the recorded penalty must match the doubling
 //!    schedule for the number of abandonments.
 //!
-//! Two commands are implemented. [`ApplyRankFloorProtection`]
+//! Three commands are implemented. [`ApplyRankFloorProtection`]
 //! (`ApplyRankFloorProtectionCmd`) pins the visible rank at the reached tier
 //! floor so a loss cannot demote the player below it, enforcing every invariant,
 //! and on success emits [`Event::RankFloorProtected`] (`ranked.rank.floor.protected`).
@@ -29,6 +29,11 @@
 //! suspected smurf that has reached [`SMURF_ELEVATION_MATCHES`] (20) matches —
 //! into the next bracket, enforcing the same rest invariants, and on success
 //! emits [`Event::SmurfElevated`] (`smurf.elevated`).
+//! [`ApplyDisconnectPenalty`] (`ApplyDisconnectPenaltyCmd`) charges an escalating
+//! penalty for an abandonment — doubling the prior charge — enforcing every
+//! invariant (the disconnect-escalation invariant confirming the existing ledger
+//! is consistent before the schedule advances), and on success emits
+//! [`Event::DisconnectPenaltyApplied`] (`disconnect.penalty.applied`).
 //! This module is hand-written (it no longer uses `shared::stub_aggregate!`) but
 //! preserves the same public surface — a [`RankedStanding`] aggregate and a
 //! [`RankedStandingRepository`] port — so the persistence adapters in
@@ -48,6 +53,10 @@ const APPLY_RANK_FLOOR_PROTECTION: &str = "ApplyRankFloorProtectionCmd";
 /// The command name [`RankedStanding::execute`] recognizes for auto-elevating a
 /// detected smurf to a higher bracket.
 const ELEVATE_SMURF: &str = "ElevateSmurfCmd";
+
+/// The command name [`RankedStanding::execute`] recognizes for charging an
+/// escalating disconnect penalty for an abandonment.
+const APPLY_DISCONNECT_PENALTY: &str = "ApplyDisconnectPenaltyCmd";
 
 /// Stars per tier: the visible rank advances through each tier with three stars,
 /// after which the player promotes to the next tier. A live win streak may add
@@ -212,6 +221,56 @@ impl ElevateSmurf {
     }
 }
 
+/// The `ApplyDisconnectPenaltyCmd` payload: the standing to penalize, its player,
+/// and the count of penalties already charged. Field names are the ladder
+/// service's `camelCase` schema.
+///
+/// Build one directly and turn it into a [`Command`] with
+/// [`ApplyDisconnectPenalty::into_command`], or decode it from a command payload
+/// via [`serde_json`] inside [`RankedStanding::execute`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ApplyDisconnectPenalty {
+    /// Identity of the standing being penalized; must name the standing this
+    /// aggregate records.
+    pub standing_id: String,
+    /// The player this standing belongs to. Must be non-empty and must match the
+    /// standing's own player.
+    pub player_id: String,
+    /// The number of disconnect penalties already charged (i.e. prior
+    /// abandonments). Must agree with the standing's recorded abandonment count,
+    /// so the escalation continues the doubling schedule from the right place.
+    pub prior_penalties: u32,
+}
+
+impl ApplyDisconnectPenalty {
+    /// The command name this maps to.
+    pub const COMMAND: &'static str = APPLY_DISCONNECT_PENALTY;
+
+    /// Build a command charging a disconnect penalty to `standing_id` (for
+    /// `player_id`) after `prior_penalties` prior abandonments.
+    pub fn new(
+        standing_id: impl Into<String>,
+        player_id: impl Into<String>,
+        prior_penalties: u32,
+    ) -> Self {
+        Self {
+            standing_id: standing_id.into(),
+            player_id: player_id.into(),
+            prior_penalties,
+        }
+    }
+
+    /// Encode this command as a [`shared::Command`] carrying a JSON payload,
+    /// ready to hand to [`RankedStanding::execute`].
+    pub fn into_command(&self) -> Command {
+        // Serialization of a plain data struct to a Vec cannot fail here.
+        let payload =
+            serde_json::to_vec(self).expect("ApplyDisconnectPenalty is always serializable");
+        Command::with_payload(Self::COMMAND, payload)
+    }
+}
+
 /// The elevation, carried by [`Event::SmurfElevated`] and thus by the emitted
 /// `smurf.elevated` event.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -238,6 +297,23 @@ pub struct RankFloorProtected {
     pub tier_floor: Tier,
 }
 
+/// The charged penalty, carried by [`Event::DisconnectPenaltyApplied`] and thus
+/// by the emitted `disconnect.penalty.applied` event.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DisconnectPenaltyApplied {
+    /// The standing that was penalized.
+    pub standing_id: String,
+    /// The player the standing belongs to.
+    pub player_id: String,
+    /// The number of penalties charged before this one.
+    pub prior_penalties: u32,
+    /// The penalty (rating points) charged for this abandonment, doubled from the
+    /// prior charge under the escalation schedule.
+    pub penalty: u32,
+    /// The standing's abandonment count after recording this penalty.
+    pub abandonments: u32,
+}
+
 /// Domain events emitted by [`RankedStanding`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Event {
@@ -247,6 +323,8 @@ pub enum Event {
     /// A suspected smurf was auto-elevated to a higher bracket after reaching the
     /// match threshold.
     SmurfElevated(SmurfElevated),
+    /// An escalating disconnect penalty was charged for an abandonment.
+    DisconnectPenaltyApplied(DisconnectPenaltyApplied),
 }
 
 impl DomainEvent for Event {
@@ -254,6 +332,7 @@ impl DomainEvent for Event {
         match self {
             Event::RankFloorProtected(_) => "ranked.rank.floor.protected",
             Event::SmurfElevated(_) => "smurf.elevated",
+            Event::DisconnectPenaltyApplied(_) => "disconnect.penalty.applied",
         }
     }
 }
@@ -668,6 +747,74 @@ impl RankedStanding {
         self.root.record(Box::new(event.clone()));
         Ok(vec![event])
     }
+
+    /// Handle `ApplyDisconnectPenaltyCmd`: verify the command targets this
+    /// standing and its player and carries a prior-penalty count consistent with
+    /// the standing's record, enforce every invariant (ratings freshness,
+    /// visible-rank shape, floor validity, smurf elevation, and — on the existing
+    /// ledger — disconnect escalation), charge the next (doubled) penalty by
+    /// recording one more abandonment, and emit
+    /// [`Event::DisconnectPenaltyApplied`].
+    fn apply_disconnect_penalty(
+        &mut self,
+        cmd: ApplyDisconnectPenalty,
+    ) -> Result<Vec<Event>, DomainError> {
+        // The command must name the standing this aggregate actually records.
+        if cmd.standing_id != self.id {
+            return Err(DomainError::InvariantViolation(format!(
+                "command targets standing '{}' but this aggregate records '{}'",
+                cmd.standing_id, self.id
+            )));
+        }
+        // A valid, matching player must be supplied.
+        if cmd.player_id.trim().is_empty() {
+            return Err(DomainError::InvariantViolation(format!(
+                "standing '{}' requires a valid playerId to apply a disconnect penalty",
+                self.id
+            )));
+        }
+        if cmd.player_id != self.player_id {
+            return Err(DomainError::InvariantViolation(format!(
+                "command names player '{}' but standing '{}' belongs to '{}'",
+                cmd.player_id, self.id, self.player_id
+            )));
+        }
+        // A valid priorPenalties must be supplied: it must agree with the
+        // abandonments the standing has actually recorded, so the escalation
+        // continues the doubling schedule from the right place.
+        if cmd.prior_penalties != self.abandonments {
+            return Err(DomainError::InvariantViolation(format!(
+                "command reports {} prior penalties but standing '{}' has recorded {} \
+                 abandonments; the prior-penalty count must match the standing's record",
+                cmd.prior_penalties, self.id, self.abandonments
+            )));
+        }
+
+        // Enforce every invariant before charging the penalty; the disconnect
+        // escalation invariant confirms the *existing* ledger is consistent under
+        // doubling so the next charge continues the schedule.
+        self.ensure_ratings_recalculated()?;
+        self.ensure_visible_rank_wellformed()?;
+        self.ensure_floor_protection_valid()?;
+        self.ensure_smurf_elevated()?;
+        self.ensure_disconnect_penalty_escalates()?;
+
+        // Charge the next abandonment: the penalty doubles from the prior charge.
+        let abandonments = self.abandonments.saturating_add(1);
+        let penalty = Self::expected_disconnect_penalty(abandonments);
+        let event = Event::DisconnectPenaltyApplied(DisconnectPenaltyApplied {
+            standing_id: cmd.standing_id,
+            player_id: cmd.player_id,
+            prior_penalties: cmd.prior_penalties,
+            penalty,
+            abandonments,
+        });
+        // Record the escalated penalty, keeping the ledger on the doubling schedule.
+        self.abandonments = abandonments;
+        self.disconnect_penalty = penalty;
+        self.root.record(Box::new(event.clone()));
+        Ok(vec![event])
+    }
 }
 
 impl Aggregate for RankedStanding {
@@ -695,6 +842,15 @@ impl Aggregate for RankedStanding {
                     ))
                 })?;
                 self.elevate_smurf(cmd)
+            }
+            APPLY_DISCONNECT_PENALTY => {
+                let cmd: ApplyDisconnectPenalty = serde_json::from_slice(&command.payload)
+                    .map_err(|e| {
+                        DomainError::InvariantViolation(format!(
+                            "malformed ApplyDisconnectPenaltyCmd payload: {e}"
+                        ))
+                    })?;
+                self.apply_disconnect_penalty(cmd)
             }
             // Any other command is unknown to this aggregate.
             _ => Err(DomainError::unknown_command(
@@ -1148,5 +1304,215 @@ mod tests {
             RankedStanding::expected_disconnect_penalty(3),
             BASE_DISCONNECT_PENALTY * 4
         );
+    }
+
+    // --- ApplyDisconnectPenaltyCmd ---------------------------------------
+
+    /// A penalty-ready standing `r-01` for player `p-1`: a fresh Glicko-2
+    /// estimate, a well-formed visible rank at its Corner floor, no pending smurf
+    /// elevation, and a disconnect ledger on the doubling schedule (two prior
+    /// abandonments owing BASE·2). Tests mutate one aspect at a time to drive a
+    /// specific rejection.
+    fn ready_disconnect() -> RankedStanding {
+        let mut standing = RankedStanding::new("r-01");
+        standing.set_player("p-1");
+        // Glicko-2 estimate recalculated after all 10 rated matches.
+        standing.set_ratings(1620.0, 80.0, 0.059, 10, 10);
+        // Two stars in Corner, no bonus star, no live streak.
+        standing.set_visible_rank(Tier::Corner, 2, false, 0);
+        // Reached floor is Corner (an anti-tilt bracket); current tier is at it.
+        standing.set_tier_floor(Tier::Corner);
+        // 10 matches, not a suspected smurf.
+        standing.set_smurf_state(10, false, false);
+        // Two abandonments → BASE·2 = 10 under the doubling schedule.
+        standing.set_disconnect_ledger(2, BASE_DISCONNECT_PENALTY * 2);
+        standing
+    }
+
+    /// A command charging a disconnect penalty to `r-01` for player `p-1` after
+    /// the two prior abandonments the ready standing records.
+    fn valid_disconnect_cmd() -> ApplyDisconnectPenalty {
+        ApplyDisconnectPenalty::new("r-01", "p-1", 2)
+    }
+
+    // Scenario: Successfully execute ApplyDisconnectPenaltyCmd.
+    #[test]
+    fn applies_penalty_and_emits_disconnect_penalty_applied_event() {
+        let mut standing = ready_disconnect();
+
+        let events = standing
+            .execute(valid_disconnect_cmd().into_command())
+            .expect("a valid disconnect penalty should succeed");
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_type(), "disconnect.penalty.applied");
+        match &events[0] {
+            Event::DisconnectPenaltyApplied(applied) => {
+                assert_eq!(applied.standing_id, "r-01");
+                assert_eq!(applied.player_id, "p-1");
+                assert_eq!(applied.prior_penalties, 2);
+                // The third abandonment doubles BASE·2 to BASE·4.
+                assert_eq!(applied.penalty, BASE_DISCONNECT_PENALTY * 4);
+                assert_eq!(applied.abandonments, 3);
+            }
+            other => panic!("expected DisconnectPenaltyApplied, got {other:?}"),
+        }
+        // The ledger advanced one step and stays on the doubling schedule.
+        assert_eq!(standing.version(), 1);
+        assert_eq!(standing.uncommitted_events().len(), 1);
+        assert_eq!(
+            standing.uncommitted_events()[0].event_type(),
+            "disconnect.penalty.applied"
+        );
+    }
+
+    // Scenario: rejected — Glicko-2 rating, RD, and volatility are recalculated
+    // after every rated match.
+    #[test]
+    fn disconnect_rejects_when_ratings_are_stale() {
+        let mut standing = ready_disconnect();
+        // The estimate lags: 10 rated matches played, but synced at match 9.
+        standing.set_ratings(1620.0, 80.0, 0.059, 10, 9);
+
+        let err = standing
+            .execute(valid_disconnect_cmd().into_command())
+            .expect_err("a stale Glicko-2 estimate must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(standing.version(), 0);
+    }
+
+    // Scenario: rejected — visible rank advances through tiers Block→Legend with
+    // 3 stars per tier; a win streak grants a bonus star.
+    #[test]
+    fn disconnect_rejects_when_visible_rank_exceeds_stars_per_tier() {
+        let mut standing = ready_disconnect();
+        // Four stars in a tier that promotes at three is malformed.
+        standing.set_visible_rank(Tier::Corner, STARS_PER_TIER + 1, false, 0);
+
+        let err = standing
+            .execute(valid_disconnect_cmd().into_command())
+            .expect_err("a tier over its star cap must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(standing.version(), 0);
+    }
+
+    // Scenario: rejected — rank-floor protection prevents demotion below a
+    // reached tier floor (anti-tilt applies to Block/Corner).
+    #[test]
+    fn disconnect_rejects_when_standing_is_below_its_floor() {
+        let mut standing = ready_disconnect();
+        // Current tier Block sits below the reached Corner floor.
+        standing.set_visible_rank(Tier::Block, 2, false, 0);
+
+        let err = standing
+            .execute(valid_disconnect_cmd().into_command())
+            .expect_err("a standing below its floor must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(standing.version(), 0);
+    }
+
+    // Scenario: rejected — a suspected smurf is auto-elevated to a higher bracket
+    // after 20 matches.
+    #[test]
+    fn disconnect_rejects_suspected_smurf_not_yet_elevated() {
+        let mut standing = ready_disconnect();
+        // A suspected smurf past the 20-match threshold that was not elevated.
+        standing.set_smurf_state(SMURF_ELEVATION_MATCHES, true, false);
+
+        let err = standing
+            .execute(valid_disconnect_cmd().into_command())
+            .expect_err("an un-elevated suspected smurf must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(standing.version(), 0);
+    }
+
+    // Scenario: rejected — disconnect penalties escalate (doubling) on repeated
+    // abandonment. Here the *existing* ledger is off the schedule, so the penalty
+    // cannot be advanced from an inconsistent base.
+    #[test]
+    fn disconnect_rejects_when_existing_penalty_does_not_double() {
+        let mut standing = ready_disconnect();
+        // Three abandonments owe BASE·4 under doubling; charging BASE·3 breaks it.
+        standing.set_disconnect_ledger(3, BASE_DISCONNECT_PENALTY * 3);
+
+        // The command must still reconcile with the (broken) recorded count.
+        let cmd = ApplyDisconnectPenalty::new("r-01", "p-1", 3);
+        let err = standing
+            .execute(cmd.into_command())
+            .expect_err("a penalty off the doubling schedule must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(standing.version(), 0);
+    }
+
+    // A valid priorPenalties must be supplied: it must agree with the standing's
+    // recorded abandonment count.
+    #[test]
+    fn disconnect_rejects_when_prior_penalties_disagree_with_record() {
+        let mut standing = ready_disconnect();
+        // The standing has recorded two abandonments; a command reporting one is
+        // invalid — it would restart the escalation from the wrong place.
+        let cmd = ApplyDisconnectPenalty::new("r-01", "p-1", 1);
+
+        let err = standing
+            .execute(cmd.into_command())
+            .expect_err("a prior-penalty count that disagrees with the record must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(standing.version(), 0);
+    }
+
+    // A command naming a different standing is rejected before any invariant runs.
+    #[test]
+    fn disconnect_rejects_command_for_a_different_standing() {
+        let mut standing = ready_disconnect();
+        let cmd = ApplyDisconnectPenalty::new("r-99", "p-1", 2);
+
+        let err = standing
+            .execute(cmd.into_command())
+            .expect_err("a command for another standing must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(standing.version(), 0);
+    }
+
+    // A command with no player is rejected.
+    #[test]
+    fn disconnect_rejects_command_without_a_player() {
+        let mut standing = ready_disconnect();
+        let cmd = ApplyDisconnectPenalty::new("r-01", "   ", 2);
+
+        let err = standing
+            .execute(cmd.into_command())
+            .expect_err("a missing playerId must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(standing.version(), 0);
+    }
+
+    // The very first abandonment charges the BASE penalty from an empty ledger.
+    #[test]
+    fn disconnect_charges_base_penalty_on_first_abandonment() {
+        let mut standing = ready_disconnect();
+        // No prior abandonments: an empty, consistent ledger.
+        standing.set_disconnect_ledger(0, 0);
+
+        let events = standing
+            .execute(ApplyDisconnectPenalty::new("r-01", "p-1", 0).into_command())
+            .expect("a first disconnect penalty should succeed");
+        match &events[0] {
+            Event::DisconnectPenaltyApplied(applied) => {
+                assert_eq!(applied.prior_penalties, 0);
+                assert_eq!(applied.penalty, BASE_DISCONNECT_PENALTY);
+                assert_eq!(applied.abandonments, 1);
+            }
+            other => panic!("expected DisconnectPenaltyApplied, got {other:?}"),
+        }
+        assert_eq!(standing.version(), 1);
+    }
+
+    #[test]
+    fn disconnect_command_payload_round_trips() {
+        let cmd = valid_disconnect_cmd();
+        let command = cmd.into_command();
+        assert_eq!(command.name, ApplyDisconnectPenalty::COMMAND);
+        let decoded: ApplyDisconnectPenalty = serde_json::from_slice(&command.payload).unwrap();
+        assert_eq!(decoded, valid_disconnect_cmd());
     }
 }
