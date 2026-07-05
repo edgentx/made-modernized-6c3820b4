@@ -19,14 +19,16 @@
 //!    the order granted; an Order whose refund/entitlement ledger is out of
 //!    balance may not be confirmed.
 //!
-//! Two commands are implemented. [`CreateOrder`] (`CreateOrderCmd`) opens a fiat
+//! Three commands are implemented. [`CreateOrder`] (`CreateOrderCmd`) opens a fiat
 //! order from a cart of SKUs — given a playerId, lineItems, and a currency it
 //! enforces every invariant and, on success, emits [`Event::OrderCreated`]
 //! (`order.created`). [`ConfirmPayment`] (`ConfirmPaymentCmd`) then marks payment
 //! confirmed from a verified Stripe webhook, enforcing every invariant, and on
-//! success emits [`Event::PaymentConfirmed`] (`payment.confirmed`). Both commands
-//! re-check the same five invariants against the aggregate's state. This module
-//! is hand-written (it does not use
+//! success emits [`Event::PaymentConfirmed`] (`payment.confirmed`). [`RefundOrder`]
+//! (`RefundOrderCmd`) reverses the entitlements granted by the order and emits
+//! [`Event::OrderRefunded`] (`order.refunded`). All commands re-check the same
+//! five invariants against the aggregate's state. This module is hand-written (it
+//! does not use
 //! `shared::stub_aggregate!`) but preserves the same public surface — an
 //! [`Order`] aggregate and an [`OrderRepository`] port — so any persistence
 //! adapters compile against it unchanged, exactly like its sibling
@@ -45,6 +47,9 @@ const CREATE_ORDER: &str = "CreateOrderCmd";
 
 /// The command name that confirms payment for an existing Order.
 const CONFIRM_PAYMENT: &str = "ConfirmPaymentCmd";
+
+/// The command name that refunds an existing Order.
+const REFUND_ORDER: &str = "RefundOrderCmd";
 
 /// The `CreateOrderCmd` payload: opens a fiat order for `player_id` from a cart
 /// of SKUs (`line_items`) settling in `currency`. Field names use the payments
@@ -134,6 +139,43 @@ impl ConfirmPayment {
     }
 }
 
+/// The `RefundOrderCmd` payload: which Order is being refunded and why the
+/// refund is being requested. Field names use the payments service's `camelCase`
+/// schema.
+///
+/// Build one directly and turn it into a [`Command`] with
+/// [`RefundOrder::into_command`], or decode it from a command payload via
+/// [`serde_json`] inside [`Order::execute`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RefundOrder {
+    /// The Order being refunded; must name this Order, and must be non-empty.
+    pub order_id: String,
+    /// The reason for the refund; must be non-empty.
+    pub reason: String,
+}
+
+impl RefundOrder {
+    /// The command name this maps to.
+    pub const COMMAND: &'static str = REFUND_ORDER;
+
+    /// Build a command refunding `order_id` for `reason`.
+    pub fn new(order_id: impl Into<String>, reason: impl Into<String>) -> Self {
+        Self {
+            order_id: order_id.into(),
+            reason: reason.into(),
+        }
+    }
+
+    /// Encode this command as a [`shared::Command`] carrying a JSON payload,
+    /// ready to hand to [`Order::execute`].
+    pub fn into_command(&self) -> Command {
+        // Serialization of a plain data struct to a Vec cannot fail here.
+        let payload = serde_json::to_vec(self).expect("RefundOrder is always serializable");
+        Command::with_payload(Self::COMMAND, payload)
+    }
+}
+
 /// The order that was opened, carried by [`Event::OrderCreated`] and thus by the
 /// emitted `order.created` event.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -158,6 +200,16 @@ pub struct PaymentConfirmed {
     pub payment_intent_ref: String,
 }
 
+/// The order that was refunded, carried by [`Event::OrderRefunded`] and thus by
+/// the emitted `order.refunded` event.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OrderRefunded {
+    /// The Order whose entitlements were reversed.
+    pub order_id: String,
+    /// The reason supplied for the refund.
+    pub reason: String,
+}
+
 /// Domain events emitted by [`Order`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Event {
@@ -165,6 +217,8 @@ pub enum Event {
     OrderCreated(OrderCreated),
     /// Payment for the Order was confirmed from a verified Stripe webhook.
     PaymentConfirmed(PaymentConfirmed),
+    /// The Order was refunded and its granted entitlements were reversed.
+    OrderRefunded(OrderRefunded),
 }
 
 impl DomainEvent for Event {
@@ -172,6 +226,7 @@ impl DomainEvent for Event {
         match self {
             Event::OrderCreated(_) => "order.created",
             Event::PaymentConfirmed(_) => "payment.confirmed",
+            Event::OrderRefunded(_) => "order.refunded",
         }
     }
 }
@@ -180,11 +235,11 @@ impl DomainEvent for Event {
 ///
 /// Mirrors the shape produced by [`shared::stub_aggregate!`] (identity plus an
 /// embedded [`AggregateRoot`]) so the surrounding wiring is unchanged, while it
-/// now carries the state the [`ConfirmPayment`] command validates against:
+/// now carries the state the implemented commands validate against:
 /// whether the payment currency is fiat (never `$MADE`), whether the order
 /// total equals the sum of its line items, whether the confirming webhook was
-/// HMAC-verified, whether this payment intent was already processed, and whether
-/// the refund/entitlement ledger balances.
+/// HMAC-verified, whether this payment intent was already processed by this
+/// Order, and whether the refund/entitlement ledger balances.
 ///
 /// A fresh Order from [`Order::new`] is confirmable: it settles in fiat via
 /// Stripe, its total matches its line items, its webhook is HMAC-verified, its
@@ -206,6 +261,8 @@ pub struct Order {
     /// Whether this Stripe payment intent has already been processed. Confirming
     /// an already-processed intent would double-fulfill, so it is rejected.
     payment_intent_already_processed: bool,
+    /// Whether this Order has already accepted a verified payment confirmation.
+    payment_confirmed: bool,
     /// Whether every refund reverses exactly the entitlements the order granted
     /// (the refund/entitlement ledger balances).
     refund_reverses_exactly: bool,
@@ -225,6 +282,7 @@ impl Order {
             total_matches_line_items: true,
             webhook_hmac_verified: true,
             payment_intent_already_processed: false,
+            payment_confirmed: false,
             refund_reverses_exactly: true,
         }
     }
@@ -263,6 +321,11 @@ impl Order {
     /// Record whether this Stripe payment intent has already been processed.
     pub fn set_payment_intent_already_processed(&mut self, already: bool) {
         self.payment_intent_already_processed = already;
+    }
+
+    /// Record whether this Order has accepted a verified payment confirmation.
+    pub fn set_payment_confirmed(&mut self, confirmed: bool) {
+        self.payment_confirmed = confirmed;
     }
 
     /// Record whether every refund reverses exactly the entitlements granted.
@@ -317,6 +380,21 @@ impl Order {
             return Err(DomainError::InvariantViolation(format!(
                 "order '{}' payment intent was already processed; processing is idempotent per \
                  Stripe payment intent (no double-fulfillment)",
+                self.id
+            )));
+        }
+        Ok(())
+    }
+
+    /// Refund idempotency invariant: a processed intent is valid for refund only
+    /// when this Order's own successful confirmation produced that processed
+    /// state. Otherwise refunding would operate on an externally pre-processed
+    /// intent and risk double-fulfillment.
+    fn ensure_refund_intent_state_is_consistent(&self) -> Result<(), DomainError> {
+        if self.payment_intent_already_processed && !self.payment_confirmed {
+            return Err(DomainError::InvariantViolation(format!(
+                "order '{}' payment intent was already processed outside this Order; processing \
+                 is idempotent per Stripe payment intent (no double-fulfillment)",
                 self.id
             )));
         }
@@ -429,10 +507,53 @@ impl Order {
         // Mark the payment intent processed so a replayed webhook for the same
         // intent is rejected by the idempotency invariant — no double-fulfillment.
         self.payment_intent_already_processed = true;
+        self.payment_confirmed = true;
 
         let event = Event::PaymentConfirmed(PaymentConfirmed {
             order_id: cmd.order_id,
             payment_intent_ref: cmd.payment_intent_ref,
+        });
+        self.root.record(Box::new(event.clone()));
+        Ok(vec![event])
+    }
+
+    /// Handle `RefundOrderCmd`: verify the command carries a valid orderId
+    /// (naming this Order) and refund reason; enforce every invariant (fiat via
+    /// Stripe, total-equals-line-items, HMAC-verified webhook, idempotency, and
+    /// refund-reverses-exactly); and emit [`Event::OrderRefunded`] to represent
+    /// the entitlement reversal.
+    fn refund_order(&mut self, cmd: RefundOrder) -> Result<Vec<Event>, DomainError> {
+        // A valid orderId and reason must be supplied.
+        if cmd.order_id.trim().is_empty() {
+            return Err(DomainError::InvariantViolation(format!(
+                "order '{}' requires a valid orderId to refund",
+                self.id
+            )));
+        }
+        if cmd.reason.trim().is_empty() {
+            return Err(DomainError::InvariantViolation(format!(
+                "order '{}' requires a valid reason to refund",
+                self.id
+            )));
+        }
+        // The command must name the Order it is dispatched to.
+        if cmd.order_id != self.id {
+            return Err(DomainError::InvariantViolation(format!(
+                "command targets order '{}' but this aggregate is order '{}'",
+                cmd.order_id, self.id
+            )));
+        }
+
+        // Enforce every invariant before recording the refund.
+        self.ensure_fiat_via_stripe()?;
+        self.ensure_total_matches_line_items()?;
+        self.ensure_webhook_hmac_verified()?;
+        self.ensure_refund_intent_state_is_consistent()?;
+        self.ensure_refund_reverses_exactly()?;
+
+        let event = Event::OrderRefunded(OrderRefunded {
+            order_id: cmd.order_id,
+            reason: cmd.reason,
         });
         self.root.record(Box::new(event.clone()));
         Ok(vec![event])
@@ -465,6 +586,14 @@ impl Aggregate for Order {
                     })?;
                 self.confirm_payment(cmd)
             }
+            REFUND_ORDER => {
+                let cmd: RefundOrder = serde_json::from_slice(&command.payload).map_err(|e| {
+                    DomainError::InvariantViolation(format!(
+                        "malformed RefundOrderCmd payload: {e}"
+                    ))
+                })?;
+                self.refund_order(cmd)
+            }
             // Any other command is unknown to this aggregate.
             _ => Err(DomainError::unknown_command(
                 <Self as Aggregate>::aggregate_type(),
@@ -491,6 +620,7 @@ mod tests {
         order.set_total_matches_line_items(true);
         order.set_webhook_hmac_verified(true);
         order.set_payment_intent_already_processed(false);
+        order.set_payment_confirmed(false);
         order.set_refund_reverses_exactly(true);
         order
     }
@@ -498,6 +628,11 @@ mod tests {
     /// A command confirming payment intent `pi_123` for order `o-01`.
     fn valid_cmd() -> ConfirmPayment {
         ConfirmPayment::new("o-01", "pi_123")
+    }
+
+    /// A command refunding order `o-01` because the buyer requested it.
+    fn valid_refund_cmd() -> RefundOrder {
+        RefundOrder::new("o-01", "buyer requested refund")
     }
 
     /// A command opening order `o-01` for player `p-01` from a two-SKU cart
@@ -824,5 +959,165 @@ mod tests {
         assert_eq!(command.name, ConfirmPayment::COMMAND);
         let decoded: ConfirmPayment = serde_json::from_slice(&command.payload).unwrap();
         assert_eq!(decoded, valid_cmd());
+    }
+
+    // Scenario: Successfully execute RefundOrderCmd.
+    #[test]
+    fn refunds_and_emits_order_refunded_event() {
+        let mut order = ready_order();
+
+        let events = order
+            .execute(valid_refund_cmd().into_command())
+            .expect("valid refund should succeed");
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_type(), "order.refunded");
+        match &events[0] {
+            Event::OrderRefunded(refunded) => {
+                assert_eq!(refunded.order_id, "o-01");
+                assert_eq!(refunded.reason, "buyer requested refund");
+            }
+            other => panic!("expected OrderRefunded, got {other:?}"),
+        }
+        // The Order recorded the refund event.
+        assert_eq!(order.version(), 1);
+        assert_eq!(order.uncommitted_events().len(), 1);
+        assert_eq!(order.uncommitted_events()[0].event_type(), "order.refunded");
+    }
+
+    #[test]
+    fn refunds_after_successful_payment_confirmation() {
+        let mut order = ready_order();
+
+        order
+            .execute(valid_cmd().into_command())
+            .expect("payment confirmation should succeed");
+        let events = order
+            .execute(valid_refund_cmd().into_command())
+            .expect("a confirmed order should be refundable");
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_type(), "order.refunded");
+        assert_eq!(order.version(), 2);
+        assert_eq!(order.uncommitted_events().len(), 2);
+        assert_eq!(
+            order.uncommitted_events()[0].event_type(),
+            "payment.confirmed"
+        );
+        assert_eq!(order.uncommitted_events()[1].event_type(), "order.refunded");
+    }
+
+    // Scenario: RefundOrderCmd rejected — Payment currency is fiat via Stripe
+    // only — an Order may never settle in $MADE.
+    #[test]
+    fn refund_rejects_when_currency_is_not_fiat_via_stripe() {
+        let mut order = ready_order();
+        // The Order attempts to settle in $MADE rather than fiat via Stripe.
+        order.set_currency_is_fiat_via_stripe(false);
+
+        let err = order
+            .execute(valid_refund_cmd().into_command())
+            .expect_err("an Order settling in $MADE must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(order.version(), 0);
+    }
+
+    // Scenario: RefundOrderCmd rejected — The order total must equal the sum of
+    // its line items.
+    #[test]
+    fn refund_rejects_when_total_does_not_match_line_items() {
+        let mut order = ready_order();
+        // The order total no longer equals the sum of its line items.
+        order.set_total_matches_line_items(false);
+
+        let err = order
+            .execute(valid_refund_cmd().into_command())
+            .expect_err("an Order whose total mismatches its line items must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(order.version(), 0);
+    }
+
+    // Scenario: RefundOrderCmd rejected — Fulfillment occurs only after payment
+    // is confirmed via an HMAC-verified Stripe webhook.
+    #[test]
+    fn refund_rejects_when_webhook_not_hmac_verified() {
+        let mut order = ready_order();
+        // The confirming webhook's HMAC signature was not verified.
+        order.set_webhook_hmac_verified(false);
+
+        let err = order
+            .execute(valid_refund_cmd().into_command())
+            .expect_err("an unverified Stripe webhook must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(order.version(), 0);
+    }
+
+    // Scenario: RefundOrderCmd rejected — Processing is idempotent per Stripe
+    // payment intent (no double-fulfillment).
+    #[test]
+    fn refund_rejects_when_payment_intent_already_processed() {
+        let mut order = ready_order();
+        // This payment intent has already been processed once.
+        order.set_payment_intent_already_processed(true);
+
+        let err = order
+            .execute(valid_refund_cmd().into_command())
+            .expect_err("an already-processed payment intent must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(order.version(), 0);
+    }
+
+    // Scenario: RefundOrderCmd rejected — A refund reverses exactly the
+    // entitlements the order granted.
+    #[test]
+    fn refund_rejects_when_refund_does_not_reverse_exactly() {
+        let mut order = ready_order();
+        // The refund/entitlement ledger is out of balance.
+        order.set_refund_reverses_exactly(false);
+
+        let err = order
+            .execute(valid_refund_cmd().into_command())
+            .expect_err("an out-of-balance refund ledger must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(order.version(), 0);
+    }
+
+    // RefundOrderCmd naming a different Order is rejected before any invariant
+    // runs.
+    #[test]
+    fn refund_rejects_command_for_a_different_order() {
+        let mut order = ready_order();
+        let cmd = RefundOrder::new("o-99", "buyer requested refund");
+
+        let err = order
+            .execute(cmd.into_command())
+            .expect_err("a refund for another order must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(order.version(), 0);
+    }
+
+    // RefundOrderCmd missing any required field is rejected.
+    #[test]
+    fn refund_rejects_command_with_missing_fields() {
+        for cmd in [
+            RefundOrder::new("   ", "buyer requested refund"),
+            RefundOrder::new("o-01", "   "),
+        ] {
+            let mut order = ready_order();
+            let err = order
+                .execute(cmd.into_command())
+                .expect_err("a refund command with a missing field must be rejected");
+            assert!(matches!(err, DomainError::InvariantViolation(_)));
+            assert_eq!(order.version(), 0);
+        }
+    }
+
+    #[test]
+    fn refund_command_payload_round_trips() {
+        let cmd = valid_refund_cmd();
+        let command = cmd.into_command();
+        assert_eq!(command.name, RefundOrder::COMMAND);
+        let decoded: RefundOrder = serde_json::from_slice(&command.payload).unwrap();
+        assert_eq!(decoded, valid_refund_cmd());
     }
 }
