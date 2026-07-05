@@ -21,10 +21,14 @@
 //!    repeated abandonment; the recorded penalty must match the doubling
 //!    schedule for the number of abandonments.
 //!
-//! The only command implemented so far is [`ApplyRankFloorProtection`]
-//! (`ApplyRankFloorProtectionCmd`): it pins the visible rank at the reached tier
+//! Two commands are implemented. [`ApplyRankFloorProtection`]
+//! (`ApplyRankFloorProtectionCmd`) pins the visible rank at the reached tier
 //! floor so a loss cannot demote the player below it, enforcing every invariant,
 //! and on success emits [`Event::RankFloorProtected`] (`ranked.rank.floor.protected`).
+//! [`ElevateSmurf`] (`ElevateSmurfCmd`) auto-promotes a detected smurf — a
+//! suspected smurf that has reached [`SMURF_ELEVATION_MATCHES`] (20) matches —
+//! into the next bracket, enforcing the same rest invariants, and on success
+//! emits [`Event::SmurfElevated`] (`smurf.elevated`).
 //! This module is hand-written (it no longer uses `shared::stub_aggregate!`) but
 //! preserves the same public surface — a [`RankedStanding`] aggregate and a
 //! [`RankedStandingRepository`] port — so the persistence adapters in
@@ -38,8 +42,12 @@ use shared::{Aggregate, AggregateRoot, Command, DomainError, DomainEvent, Reposi
 /// used for command routing.
 const AGGREGATE_TYPE: &str = "RankedStanding";
 
-/// The command name [`RankedStanding::execute`] recognizes.
+/// The command name [`RankedStanding::execute`] recognizes for pinning a floor.
 const APPLY_RANK_FLOOR_PROTECTION: &str = "ApplyRankFloorProtectionCmd";
+
+/// The command name [`RankedStanding::execute`] recognizes for auto-elevating a
+/// detected smurf to a higher bracket.
+const ELEVATE_SMURF: &str = "ElevateSmurfCmd";
 
 /// Stars per tier: the visible rank advances through each tier with three stars,
 /// after which the player promotes to the next tier. A live win streak may add
@@ -101,6 +109,18 @@ impl Tier {
             other
         }
     }
+
+    /// The next bracket up the ladder — the tier a suspected smurf is elevated
+    /// into. [`Tier::Legend`], already the apex, elevates to itself.
+    fn elevated_bracket(self) -> Tier {
+        match self {
+            Tier::Block => Tier::Corner,
+            Tier::Corner => Tier::Contender,
+            Tier::Contender => Tier::Champion,
+            Tier::Champion => Tier::Legend,
+            Tier::Legend => Tier::Legend,
+        }
+    }
 }
 
 /// The `ApplyRankFloorProtectionCmd` payload: the standing to protect and the
@@ -144,6 +164,68 @@ impl ApplyRankFloorProtection {
     }
 }
 
+/// The `ElevateSmurfCmd` payload: the standing to elevate, its player, and the
+/// match count that tripped smurf detection. Field names are the ladder
+/// service's `camelCase` schema.
+///
+/// Build one directly and turn it into a [`Command`] with
+/// [`ElevateSmurf::into_command`], or decode it from a command payload via
+/// [`serde_json`] inside [`RankedStanding::execute`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ElevateSmurf {
+    /// Identity of the standing being elevated; must name the standing this
+    /// aggregate records.
+    pub standing_id: String,
+    /// The player this standing belongs to. Must be non-empty and must match the
+    /// standing's own player.
+    pub player_id: String,
+    /// The observed match count that tripped smurf detection. Must match the
+    /// standing's recorded matches played, and reach [`SMURF_ELEVATION_MATCHES`].
+    pub match_count: u32,
+}
+
+impl ElevateSmurf {
+    /// The command name this maps to.
+    pub const COMMAND: &'static str = ELEVATE_SMURF;
+
+    /// Build a command elevating `standing_id` (for `player_id`) after
+    /// `match_count` matches.
+    pub fn new(
+        standing_id: impl Into<String>,
+        player_id: impl Into<String>,
+        match_count: u32,
+    ) -> Self {
+        Self {
+            standing_id: standing_id.into(),
+            player_id: player_id.into(),
+            match_count,
+        }
+    }
+
+    /// Encode this command as a [`shared::Command`] carrying a JSON payload,
+    /// ready to hand to [`RankedStanding::execute`].
+    pub fn into_command(&self) -> Command {
+        // Serialization of a plain data struct to a Vec cannot fail here.
+        let payload = serde_json::to_vec(self).expect("ElevateSmurf is always serializable");
+        Command::with_payload(Self::COMMAND, payload)
+    }
+}
+
+/// The elevation, carried by [`Event::SmurfElevated`] and thus by the emitted
+/// `smurf.elevated` event.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SmurfElevated {
+    /// The standing that was elevated.
+    pub standing_id: String,
+    /// The player the standing belongs to.
+    pub player_id: String,
+    /// The match count that tripped smurf detection.
+    pub match_count: u32,
+    /// The higher bracket the suspected smurf was elevated into.
+    pub elevated_to: Tier,
+}
+
 /// The protected floor, carried by [`Event::RankFloorProtected`] and thus by the
 /// emitted `ranked.rank.floor.protected` event.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -162,12 +244,16 @@ pub enum Event {
     /// The visible rank was pinned at the reached tier floor: a subsequent loss
     /// cannot demote the player below it.
     RankFloorProtected(RankFloorProtected),
+    /// A suspected smurf was auto-elevated to a higher bracket after reaching the
+    /// match threshold.
+    SmurfElevated(SmurfElevated),
 }
 
 impl DomainEvent for Event {
     fn event_type(&self) -> &'static str {
         match self {
             Event::RankFloorProtected(_) => "ranked.rank.floor.protected",
+            Event::SmurfElevated(_) => "smurf.elevated",
         }
     }
 }
@@ -450,6 +536,90 @@ impl RankedStanding {
         Ok(())
     }
 
+    /// Smurf-elevation eligibility: a standing may be elevated only when it is a
+    /// *suspected smurf* that has reached [`SMURF_ELEVATION_MATCHES`] matches and
+    /// has not already been elevated. This is the transition that *establishes*
+    /// the smurf-elevation rest invariant ([`Self::ensure_smurf_elevated`]),
+    /// which is why `ElevateSmurfCmd` gates on eligibility rather than on that
+    /// rest invariant (which by construction the pre-elevation state violates).
+    fn ensure_smurf_elevation_warranted(&self) -> Result<(), DomainError> {
+        if self.elevated {
+            return Err(DomainError::InvariantViolation(format!(
+                "standing '{}' has already been elevated to a higher bracket; a smurf is elevated \
+                 at most once",
+                self.id
+            )));
+        }
+        if !(self.suspected_smurf && self.matches_played >= SMURF_ELEVATION_MATCHES) {
+            return Err(DomainError::InvariantViolation(format!(
+                "standing '{}' is not eligible for smurf elevation: only a suspected smurf is \
+                 auto-elevated to a higher bracket, and only after {} matches (has {}, suspected: \
+                 {})",
+                self.id, SMURF_ELEVATION_MATCHES, self.matches_played, self.suspected_smurf
+            )));
+        }
+        Ok(())
+    }
+
+    /// Handle `ElevateSmurfCmd`: verify the command targets this standing and its
+    /// player and carries a match count consistent with the standing's record,
+    /// enforce the standing's rest invariants (ratings freshness, visible-rank
+    /// shape, floor validity, and disconnect escalation), confirm elevation is
+    /// warranted, promote the standing to the next bracket, and emit
+    /// [`Event::SmurfElevated`].
+    fn elevate_smurf(&mut self, cmd: ElevateSmurf) -> Result<Vec<Event>, DomainError> {
+        // The command must name the standing this aggregate actually records.
+        if cmd.standing_id != self.id {
+            return Err(DomainError::InvariantViolation(format!(
+                "command targets standing '{}' but this aggregate records '{}'",
+                cmd.standing_id, self.id
+            )));
+        }
+        // A valid, matching player must be supplied.
+        if cmd.player_id.trim().is_empty() {
+            return Err(DomainError::InvariantViolation(format!(
+                "standing '{}' requires a valid playerId to elevate a smurf",
+                self.id
+            )));
+        }
+        if cmd.player_id != self.player_id {
+            return Err(DomainError::InvariantViolation(format!(
+                "command names player '{}' but standing '{}' belongs to '{}'",
+                cmd.player_id, self.id, self.player_id
+            )));
+        }
+        // A valid matchCount must be supplied: it must agree with the matches the
+        // standing has actually recorded.
+        if cmd.match_count != self.matches_played {
+            return Err(DomainError::InvariantViolation(format!(
+                "command reports {} matches but standing '{}' has recorded {}; the elevation match \
+                 count must match the standing's record",
+                cmd.match_count, self.id, self.matches_played
+            )));
+        }
+
+        // Enforce the rest invariants that hold independently of elevation.
+        self.ensure_ratings_recalculated()?;
+        self.ensure_visible_rank_wellformed()?;
+        self.ensure_floor_protection_valid()?;
+        self.ensure_disconnect_penalty_escalates()?;
+        // Elevation is warranted only for an un-elevated, eligible suspected smurf.
+        self.ensure_smurf_elevation_warranted()?;
+
+        let elevated_to = self.tier.elevated_bracket();
+        let event = Event::SmurfElevated(SmurfElevated {
+            standing_id: cmd.standing_id,
+            player_id: cmd.player_id,
+            match_count: cmd.match_count,
+            elevated_to,
+        });
+        // Promote to the higher bracket and record that this smurf is now elevated.
+        self.tier = elevated_to;
+        self.elevated = true;
+        self.root.record(Box::new(event.clone()));
+        Ok(vec![event])
+    }
+
     /// Handle `ApplyRankFloorProtectionCmd`: verify the command targets this
     /// standing and its player, enforce every invariant (ratings freshness,
     /// visible-rank shape, floor validity, smurf elevation, and disconnect
@@ -518,6 +688,14 @@ impl Aggregate for RankedStanding {
                     })?;
                 self.apply_rank_floor_protection(cmd)
             }
+            ELEVATE_SMURF => {
+                let cmd: ElevateSmurf = serde_json::from_slice(&command.payload).map_err(|e| {
+                    DomainError::InvariantViolation(format!(
+                        "malformed ElevateSmurfCmd payload: {e}"
+                    ))
+                })?;
+                self.elevate_smurf(cmd)
+            }
             // Any other command is unknown to this aggregate.
             _ => Err(DomainError::unknown_command(
                 <Self as Aggregate>::aggregate_type(),
@@ -578,6 +756,7 @@ mod tests {
                 assert_eq!(protected.player_id, "p-1");
                 assert_eq!(protected.tier_floor, Tier::Corner);
             }
+            other => panic!("expected RankFloorProtected, got {other:?}"),
         }
         // The standing recorded the event and holds at or above its floor.
         assert!(standing.tier().rank() >= standing.tier_floor().rank());
@@ -754,6 +933,204 @@ mod tests {
         assert_eq!(command.name, ApplyRankFloorProtection::COMMAND);
         let decoded: ApplyRankFloorProtection = serde_json::from_slice(&command.payload).unwrap();
         assert_eq!(decoded, valid_cmd());
+    }
+
+    // --- ElevateSmurfCmd -------------------------------------------------
+
+    /// An elevation-ready standing `r-01` for player `p-1`: a suspected smurf
+    /// that has reached the 20-match threshold and has *not* yet been elevated,
+    /// with a fresh Glicko-2 estimate, a well-formed visible rank at its Corner
+    /// floor, and a disconnect ledger on the doubling schedule. Tests mutate one
+    /// aspect at a time to drive a specific rejection.
+    fn ready_smurf() -> RankedStanding {
+        let mut standing = RankedStanding::new("r-01");
+        standing.set_player("p-1");
+        // Glicko-2 estimate recalculated after all 20 rated matches.
+        standing.set_ratings(1720.0, 70.0, 0.058, 20, 20);
+        // Two stars in Corner, no bonus star, no live streak.
+        standing.set_visible_rank(Tier::Corner, 2, false, 0);
+        // Reached floor is Corner (an anti-tilt bracket); current tier is at it.
+        standing.set_tier_floor(Tier::Corner);
+        // A suspected smurf, 20 matches played, not yet elevated.
+        standing.set_smurf_state(SMURF_ELEVATION_MATCHES, true, false);
+        // Two abandonments → BASE·2 = 10 under the doubling schedule.
+        standing.set_disconnect_ledger(2, BASE_DISCONNECT_PENALTY * 2);
+        standing
+    }
+
+    /// A command elevating `r-01` for player `p-1` after 20 matches.
+    fn valid_elevate_cmd() -> ElevateSmurf {
+        ElevateSmurf::new("r-01", "p-1", SMURF_ELEVATION_MATCHES)
+    }
+
+    // Scenario: Successfully execute ElevateSmurfCmd.
+    #[test]
+    fn elevates_smurf_and_emits_smurf_elevated_event() {
+        let mut standing = ready_smurf();
+
+        let events = standing
+            .execute(valid_elevate_cmd().into_command())
+            .expect("a warranted elevation should succeed");
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_type(), "smurf.elevated");
+        match &events[0] {
+            Event::SmurfElevated(elevated) => {
+                assert_eq!(elevated.standing_id, "r-01");
+                assert_eq!(elevated.player_id, "p-1");
+                assert_eq!(elevated.match_count, SMURF_ELEVATION_MATCHES);
+                // Elevated one bracket up, from Corner to Contender.
+                assert_eq!(elevated.elevated_to, Tier::Contender);
+            }
+            other => panic!("expected SmurfElevated, got {other:?}"),
+        }
+        // The standing was promoted and recorded the event.
+        assert_eq!(standing.tier(), Tier::Contender);
+        assert_eq!(standing.version(), 1);
+        assert_eq!(standing.uncommitted_events().len(), 1);
+        assert_eq!(
+            standing.uncommitted_events()[0].event_type(),
+            "smurf.elevated"
+        );
+    }
+
+    // Scenario: rejected — Glicko-2 rating, RD, and volatility are recalculated
+    // after every rated match.
+    #[test]
+    fn elevate_rejects_when_ratings_are_stale() {
+        let mut standing = ready_smurf();
+        // The estimate lags: 20 rated matches played, but synced at match 19.
+        standing.set_ratings(1720.0, 70.0, 0.058, 20, 19);
+
+        let err = standing
+            .execute(valid_elevate_cmd().into_command())
+            .expect_err("a stale Glicko-2 estimate must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(standing.version(), 0);
+    }
+
+    // Scenario: rejected — visible rank advances through tiers Block→Legend with
+    // 3 stars per tier; a win streak grants a bonus star.
+    #[test]
+    fn elevate_rejects_when_visible_rank_exceeds_stars_per_tier() {
+        let mut standing = ready_smurf();
+        // Four stars in a tier that promotes at three is malformed.
+        standing.set_visible_rank(Tier::Corner, STARS_PER_TIER + 1, false, 0);
+
+        let err = standing
+            .execute(valid_elevate_cmd().into_command())
+            .expect_err("a tier over its star cap must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(standing.version(), 0);
+    }
+
+    // Scenario: rejected — rank-floor protection prevents demotion below a
+    // reached tier floor (anti-tilt applies to Block/Corner).
+    #[test]
+    fn elevate_rejects_when_standing_is_below_its_floor() {
+        let mut standing = ready_smurf();
+        // Current tier Block sits below the reached Corner floor.
+        standing.set_visible_rank(Tier::Block, 2, false, 0);
+
+        let err = standing
+            .execute(valid_elevate_cmd().into_command())
+            .expect_err("a standing below its floor must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(standing.version(), 0);
+    }
+
+    // Scenario: rejected — a suspected smurf is auto-elevated to a higher bracket
+    // after 20 matches. Here the standing is not an eligible smurf, so elevation
+    // is unwarranted.
+    #[test]
+    fn elevate_rejects_when_not_an_eligible_smurf() {
+        let mut standing = ready_smurf();
+        // Not flagged as a suspected smurf: elevation is unwarranted.
+        standing.set_smurf_state(SMURF_ELEVATION_MATCHES, false, false);
+
+        let err = standing
+            .execute(valid_elevate_cmd().into_command())
+            .expect_err("elevating a non-smurf must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(standing.version(), 0);
+    }
+
+    // Smurf-elevation rule: a standing already elevated is not elevated again.
+    #[test]
+    fn elevate_rejects_when_already_elevated() {
+        let mut standing = ready_smurf();
+        // Already elevated: a smurf is elevated at most once.
+        standing.set_smurf_state(SMURF_ELEVATION_MATCHES, true, true);
+
+        let err = standing
+            .execute(valid_elevate_cmd().into_command())
+            .expect_err("re-elevating an elevated smurf must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(standing.version(), 0);
+    }
+
+    // Scenario: rejected — disconnect penalties escalate (doubling) on repeated
+    // abandonment.
+    #[test]
+    fn elevate_rejects_when_disconnect_penalty_does_not_double() {
+        let mut standing = ready_smurf();
+        // Three abandonments owe BASE·4 under doubling; charging BASE·3 breaks it.
+        standing.set_disconnect_ledger(3, BASE_DISCONNECT_PENALTY * 3);
+
+        let err = standing
+            .execute(valid_elevate_cmd().into_command())
+            .expect_err("a penalty off the doubling schedule must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(standing.version(), 0);
+    }
+
+    // A valid matchCount must be supplied: it must agree with the standing's record.
+    #[test]
+    fn elevate_rejects_when_match_count_disagrees_with_record() {
+        let mut standing = ready_smurf();
+        // The standing has recorded 20 matches; a command reporting 19 is invalid.
+        let cmd = ElevateSmurf::new("r-01", "p-1", SMURF_ELEVATION_MATCHES - 1);
+
+        let err = standing
+            .execute(cmd.into_command())
+            .expect_err("a match count that disagrees with the record must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(standing.version(), 0);
+    }
+
+    // A command naming a different standing is rejected before any invariant runs.
+    #[test]
+    fn elevate_rejects_command_for_a_different_standing() {
+        let mut standing = ready_smurf();
+        let cmd = ElevateSmurf::new("r-99", "p-1", SMURF_ELEVATION_MATCHES);
+
+        let err = standing
+            .execute(cmd.into_command())
+            .expect_err("a command for another standing must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(standing.version(), 0);
+    }
+
+    // A command with no player is rejected.
+    #[test]
+    fn elevate_rejects_command_without_a_player() {
+        let mut standing = ready_smurf();
+        let cmd = ElevateSmurf::new("r-01", "   ", SMURF_ELEVATION_MATCHES);
+
+        let err = standing
+            .execute(cmd.into_command())
+            .expect_err("a missing playerId must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(standing.version(), 0);
+    }
+
+    #[test]
+    fn elevate_command_payload_round_trips() {
+        let cmd = valid_elevate_cmd();
+        let command = cmd.into_command();
+        assert_eq!(command.name, ElevateSmurf::COMMAND);
+        let decoded: ElevateSmurf = serde_json::from_slice(&command.payload).unwrap();
+        assert_eq!(decoded, valid_elevate_cmd());
     }
 
     #[test]
