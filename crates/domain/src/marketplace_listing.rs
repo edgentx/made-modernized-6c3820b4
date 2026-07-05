@@ -16,7 +16,10 @@
 //!
 //! [`CreateListingCmd`] (`CreateListingCmd`) validates the seller, token, price,
 //! and jurisdiction, enforces every invariant, and on success emits
-//! [`Event::ListingCreated`] (`listing.created`). This module is hand-written
+//! [`Event::ListingCreated`] (`listing.created`). [`CancelListingCmd`]
+//! (`CancelListingCmd`) withdraws an open listing: it validates the listingId,
+//! enforces the same four invariants, and on success emits
+//! [`Event::ListingCancelled`] (`listing.cancelled`). This module is hand-written
 //! (it does not use `shared::stub_aggregate!`) but preserves the same public
 //! surface as the scaffolded contexts: a [`MarketplaceListing`] aggregate and a
 //! [`MarketplaceListingRepository`] port.
@@ -32,6 +35,10 @@ const AGGREGATE_TYPE: &str = "MarketplaceListing";
 /// The command name [`MarketplaceListing::execute`] recognizes to list an owned
 /// token for sale in $MADE.
 const CREATE_LISTING: &str = "CreateListingCmd";
+
+/// The command name [`MarketplaceListing::execute`] recognizes to withdraw an
+/// open listing from $MADE.
+const CANCEL_LISTING: &str = "CancelListingCmd";
 
 /// The mandated marketplace fee split, in basis points (1 bp = 0.01%). Every
 /// settled trade applies a 5% fee split of 2.5% treasury / 1.5% reward pool /
@@ -137,6 +144,44 @@ impl CreateListingCmd {
     }
 }
 
+/// The `CancelListingCmd` payload: which listing to withdraw and the
+/// jurisdiction the cancellation originates from. Field names use the token
+/// marketplace's `camelCase` schema.
+///
+/// Build one directly and turn it into a [`Command`] with
+/// [`CancelListingCmd::into_command`], or decode it from a command payload via
+/// [`serde_json`] inside [`MarketplaceListing::execute`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CancelListingCmd {
+    /// The listing being withdrawn; must be a valid, non-empty identifier.
+    pub listing_id: String,
+    /// The jurisdiction the cancellation originates from; must not be
+    /// geo-restricted.
+    pub jurisdiction: String,
+}
+
+impl CancelListingCmd {
+    /// The command name this maps to.
+    pub const COMMAND: &'static str = CANCEL_LISTING;
+
+    /// Build a command withdrawing `listing_id` from `jurisdiction`.
+    pub fn new(listing_id: impl Into<String>, jurisdiction: impl Into<String>) -> Self {
+        Self {
+            listing_id: listing_id.into(),
+            jurisdiction: jurisdiction.into(),
+        }
+    }
+
+    /// Encode this command as a [`shared::Command`] carrying a JSON payload,
+    /// ready to hand to [`MarketplaceListing::execute`].
+    pub fn into_command(&self) -> Command {
+        // Serialization of a plain data struct to a Vec cannot fail here.
+        let payload = serde_json::to_vec(self).expect("CancelListingCmd is always serializable");
+        Command::with_payload(Self::COMMAND, payload)
+    }
+}
+
 /// The listing that was created, carried by [`Event::ListingCreated`] and thus
 /// by the emitted `listing.created` event.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -153,17 +198,30 @@ pub struct ListingCreated {
     pub fee_schedule: FeeSchedule,
 }
 
+/// The listing that was withdrawn, carried by [`Event::ListingCancelled`] and
+/// thus by the emitted `listing.cancelled` event.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ListingCancelled {
+    /// The listing that was withdrawn.
+    pub listing_id: String,
+    /// The jurisdiction the cancellation originated from.
+    pub jurisdiction: String,
+}
+
 /// Domain events emitted by [`MarketplaceListing`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Event {
     /// An owned token was listed for sale in $MADE.
     ListingCreated(ListingCreated),
+    /// An open listing was withdrawn from $MADE.
+    ListingCancelled(ListingCancelled),
 }
 
 impl DomainEvent for Event {
     fn event_type(&self) -> &'static str {
         match self {
             Event::ListingCreated(_) => "listing.created",
+            Event::ListingCancelled(_) => "listing.cancelled",
         }
     }
 }
@@ -344,6 +402,36 @@ impl MarketplaceListing {
         self.root.record(Box::new(event.clone()));
         Ok(vec![event])
     }
+
+    /// Handle `CancelListingCmd`: verify the command carries a valid listingId,
+    /// enforce every token marketplace invariant, and emit
+    /// [`Event::ListingCancelled`].
+    fn cancel_listing(&mut self, cmd: CancelListingCmd) -> Result<Vec<Event>, DomainError> {
+        if cmd.listing_id.trim().is_empty() {
+            return Err(DomainError::InvariantViolation(format!(
+                "marketplace listing '{}' requires a valid listingId to cancel a listing",
+                self.id
+            )));
+        }
+        if cmd.jurisdiction.trim().is_empty() {
+            return Err(DomainError::InvariantViolation(format!(
+                "marketplace listing '{}' requires a valid jurisdiction to cancel a listing",
+                self.id
+            )));
+        }
+
+        self.ensure_seller_owns_listed_token()?;
+        self.ensure_canonical_fee_split()?;
+        self.ensure_settlement_atomic()?;
+        self.ensure_jurisdiction_allowed(&cmd.jurisdiction)?;
+
+        let event = Event::ListingCancelled(ListingCancelled {
+            listing_id: cmd.listing_id,
+            jurisdiction: cmd.jurisdiction,
+        });
+        self.root.record(Box::new(event.clone()));
+        Ok(vec![event])
+    }
 }
 
 impl Aggregate for MarketplaceListing {
@@ -363,6 +451,15 @@ impl Aggregate for MarketplaceListing {
                         ))
                     })?;
                 self.create_listing(cmd)
+            }
+            CANCEL_LISTING => {
+                let cmd: CancelListingCmd =
+                    serde_json::from_slice(&command.payload).map_err(|e| {
+                        DomainError::InvariantViolation(format!(
+                            "malformed CancelListingCmd payload: {e}"
+                        ))
+                    })?;
+                self.cancel_listing(cmd)
             }
             // Any other command is unknown to this aggregate.
             _ => Err(DomainError::unknown_command(
@@ -511,6 +608,108 @@ mod tests {
 
         let err = listing
             .execute(Command::with_payload(CREATE_LISTING, b"not json".to_vec()))
+            .expect_err("malformed payload must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(listing.version(), 0);
+    }
+
+    /// A command withdrawing `listing-01` originating from the `US`
+    /// jurisdiction.
+    fn valid_cancel_cmd() -> CancelListingCmd {
+        CancelListingCmd::new("listing-01", "US")
+    }
+
+    // Scenario: Successfully execute CancelListingCmd.
+    #[test]
+    fn cancels_and_emits_listing_cancelled_event() {
+        let mut listing = ready_listing();
+
+        let events = listing
+            .execute(valid_cancel_cmd().into_command())
+            .expect("valid cancellation should succeed");
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_type(), "listing.cancelled");
+        match &events[0] {
+            Event::ListingCancelled(cancelled) => {
+                assert_eq!(cancelled.listing_id, "listing-01");
+                assert_eq!(cancelled.jurisdiction, "US");
+            }
+            other => panic!("expected ListingCancelled, got {other:?}"),
+        }
+        // The MarketplaceListing recorded the event and advanced its version.
+        assert_eq!(listing.version(), 1);
+        assert_eq!(listing.uncommitted_events().len(), 1);
+        assert_eq!(
+            listing.uncommitted_events()[0].event_type(),
+            "listing.cancelled"
+        );
+    }
+
+    // Scenario: rejected - The seller must own the listed token at listing and
+    // at settlement.
+    #[test]
+    fn cancel_rejects_when_seller_does_not_own_listed_token() {
+        let mut listing = ready_listing();
+        listing.set_seller_owns_listed_token(false);
+
+        let err = listing
+            .execute(valid_cancel_cmd().into_command())
+            .expect_err("a seller who does not own the token must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(listing.version(), 0);
+    }
+
+    // Scenario: rejected - Every settled trade applies the 5% fee split: 2.5%
+    // treasury / 1.5% reward pool / 1% burn.
+    #[test]
+    fn cancel_rejects_when_fee_split_is_not_canonical() {
+        let mut listing = ready_listing();
+        // A split that does not encode the mandated 2.5% / 1.5% / 1%.
+        listing.set_fee_schedule(FeeSchedule::new(300, 150, 100));
+
+        let err = listing
+            .execute(valid_cancel_cmd().into_command())
+            .expect_err("a non-canonical fee split must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(listing.version(), 0);
+    }
+
+    // Scenario: rejected - A trade settles atomically - token transfer and fee
+    // split succeed or fail together.
+    #[test]
+    fn cancel_rejects_when_settlement_is_not_atomic() {
+        let mut listing = ready_listing();
+        listing.set_settlement_atomic(false);
+
+        let err = listing
+            .execute(valid_cancel_cmd().into_command())
+            .expect_err("non-atomic settlement must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(listing.version(), 0);
+    }
+
+    // Scenario: rejected - Listings and purchases are blocked for geo-restricted
+    // jurisdictions.
+    #[test]
+    fn cancel_rejects_when_jurisdiction_is_geo_restricted() {
+        let mut listing = ready_listing();
+        listing.restrict_jurisdiction("US");
+
+        let err = listing
+            .execute(valid_cancel_cmd().into_command())
+            .expect_err("a geo-restricted jurisdiction must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(listing.version(), 0);
+    }
+
+    // A malformed payload for CancelListingCmd is a domain error, not a panic.
+    #[test]
+    fn rejects_malformed_cancel_listing_payload() {
+        let mut listing = ready_listing();
+
+        let err = listing
+            .execute(Command::with_payload(CANCEL_LISTING, b"not json".to_vec()))
             .expect_err("malformed payload must be rejected");
         assert!(matches!(err, DomainError::InvariantViolation(_)));
         assert_eq!(listing.version(), 0);
