@@ -19,10 +19,14 @@
 //!    the order granted; an Order whose refund/entitlement ledger is out of
 //!    balance may not be confirmed.
 //!
-//! The only command implemented so far is [`ConfirmPayment`] (`ConfirmPaymentCmd`):
-//! it marks payment confirmed from a verified Stripe webhook, enforcing every
-//! invariant, and on success emits [`Event::PaymentConfirmed`]
-//! (`payment.confirmed`). This module is hand-written (it does not use
+//! Two commands are implemented. [`CreateOrder`] (`CreateOrderCmd`) opens a fiat
+//! order from a cart of SKUs — given a playerId, lineItems, and a currency it
+//! enforces every invariant and, on success, emits [`Event::OrderCreated`]
+//! (`order.created`). [`ConfirmPayment`] (`ConfirmPaymentCmd`) then marks payment
+//! confirmed from a verified Stripe webhook, enforcing every invariant, and on
+//! success emits [`Event::PaymentConfirmed`] (`payment.confirmed`). Both commands
+//! re-check the same five invariants against the aggregate's state. This module
+//! is hand-written (it does not use
 //! `shared::stub_aggregate!`) but preserves the same public surface — an
 //! [`Order`] aggregate and an [`OrderRepository`] port — so any persistence
 //! adapters compile against it unchanged, exactly like its sibling
@@ -36,8 +40,61 @@ use shared::{Aggregate, AggregateRoot, Command, DomainError, DomainEvent, Reposi
 /// used for command routing.
 const AGGREGATE_TYPE: &str = "Order";
 
-/// The command name [`Order::execute`] recognizes.
+/// The command name that opens a new Order from a cart of SKUs.
+const CREATE_ORDER: &str = "CreateOrderCmd";
+
+/// The command name that confirms payment for an existing Order.
 const CONFIRM_PAYMENT: &str = "ConfirmPaymentCmd";
+
+/// The `CreateOrderCmd` payload: opens a fiat order for `player_id` from a cart
+/// of SKUs (`line_items`) settling in `currency`. Field names use the payments
+/// service's `camelCase` schema.
+///
+/// Build one directly and turn it into a [`Command`] with
+/// [`CreateOrder::into_command`], or decode it from a command payload via
+/// [`serde_json`] inside [`Order::execute`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateOrder {
+    /// The Order being opened; must name this Order, and must be non-empty.
+    pub order_id: String,
+    /// The player the order is opened for; must be non-empty.
+    pub player_id: String,
+    /// The cart of SKUs the order is composed of; must be non-empty.
+    pub line_items: Vec<String>,
+    /// The settlement currency; must be non-empty (and, per the invariants, fiat
+    /// via Stripe rather than the in-game `$MADE` currency).
+    pub currency: String,
+}
+
+impl CreateOrder {
+    /// The command name this maps to.
+    pub const COMMAND: &'static str = CREATE_ORDER;
+
+    /// Build a command opening `order_id` for `player_id` from `line_items`
+    /// settling in `currency`.
+    pub fn new(
+        order_id: impl Into<String>,
+        player_id: impl Into<String>,
+        line_items: impl IntoIterator<Item = String>,
+        currency: impl Into<String>,
+    ) -> Self {
+        Self {
+            order_id: order_id.into(),
+            player_id: player_id.into(),
+            line_items: line_items.into_iter().collect(),
+            currency: currency.into(),
+        }
+    }
+
+    /// Encode this command as a [`shared::Command`] carrying a JSON payload,
+    /// ready to hand to [`Order::execute`].
+    pub fn into_command(&self) -> Command {
+        // Serialization of a plain data struct to a Vec cannot fail here.
+        let payload = serde_json::to_vec(self).expect("CreateOrder is always serializable");
+        Command::with_payload(Self::COMMAND, payload)
+    }
+}
 
 /// The `ConfirmPaymentCmd` payload: which Order is being confirmed and the
 /// Stripe payment intent reference the confirmation is for. Field names use the
@@ -77,6 +134,20 @@ impl ConfirmPayment {
     }
 }
 
+/// The order that was opened, carried by [`Event::OrderCreated`] and thus by the
+/// emitted `order.created` event.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OrderCreated {
+    /// The Order that was opened.
+    pub order_id: String,
+    /// The player the order was opened for.
+    pub player_id: String,
+    /// The cart of SKUs the order was opened from.
+    pub line_items: Vec<String>,
+    /// The settlement currency the order was opened in.
+    pub currency: String,
+}
+
 /// The payment that was confirmed, carried by [`Event::PaymentConfirmed`] and
 /// thus by the emitted `payment.confirmed` event.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -90,6 +161,8 @@ pub struct PaymentConfirmed {
 /// Domain events emitted by [`Order`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Event {
+    /// A fiat Order was opened from a cart of SKUs.
+    OrderCreated(OrderCreated),
     /// Payment for the Order was confirmed from a verified Stripe webhook.
     PaymentConfirmed(PaymentConfirmed),
 }
@@ -97,6 +170,7 @@ pub enum Event {
 impl DomainEvent for Event {
     fn event_type(&self) -> &'static str {
         match self {
+            Event::OrderCreated(_) => "order.created",
             Event::PaymentConfirmed(_) => "payment.confirmed",
         }
     }
@@ -262,6 +336,62 @@ impl Order {
         Ok(())
     }
 
+    /// Handle `CreateOrderCmd`: verify the command carries a valid orderId
+    /// (naming this Order), a playerId, a non-empty cart of line items, and a
+    /// currency; enforce every invariant (fiat via Stripe, total-equals-line-
+    /// items, HMAC-verified webhook, idempotency, and refund-reverses-exactly);
+    /// and emit [`Event::OrderCreated`].
+    fn create_order(&mut self, cmd: CreateOrder) -> Result<Vec<Event>, DomainError> {
+        // A valid orderId, playerId, line items, and currency must be supplied.
+        if cmd.order_id.trim().is_empty() {
+            return Err(DomainError::InvariantViolation(format!(
+                "order '{}' requires a valid orderId to be created",
+                self.id
+            )));
+        }
+        if cmd.player_id.trim().is_empty() {
+            return Err(DomainError::InvariantViolation(format!(
+                "order '{}' requires a valid playerId to be created",
+                self.id
+            )));
+        }
+        if cmd.line_items.is_empty() || cmd.line_items.iter().any(|sku| sku.trim().is_empty()) {
+            return Err(DomainError::InvariantViolation(format!(
+                "order '{}' requires a non-empty cart of lineItems to be created",
+                self.id
+            )));
+        }
+        if cmd.currency.trim().is_empty() {
+            return Err(DomainError::InvariantViolation(format!(
+                "order '{}' requires a valid currency to be created",
+                self.id
+            )));
+        }
+        // The command must name the Order it is dispatched to.
+        if cmd.order_id != self.id {
+            return Err(DomainError::InvariantViolation(format!(
+                "command targets order '{}' but this aggregate is order '{}'",
+                cmd.order_id, self.id
+            )));
+        }
+
+        // Enforce every invariant before recording the creation.
+        self.ensure_fiat_via_stripe()?;
+        self.ensure_total_matches_line_items()?;
+        self.ensure_webhook_hmac_verified()?;
+        self.ensure_not_already_processed()?;
+        self.ensure_refund_reverses_exactly()?;
+
+        let event = Event::OrderCreated(OrderCreated {
+            order_id: cmd.order_id,
+            player_id: cmd.player_id,
+            line_items: cmd.line_items,
+            currency: cmd.currency,
+        });
+        self.root.record(Box::new(event.clone()));
+        Ok(vec![event])
+    }
+
     /// Handle `ConfirmPaymentCmd`: verify the command carries a valid orderId
     /// (naming this Order) and paymentIntentRef, enforce every invariant (fiat
     /// via Stripe, total-equals-line-items, HMAC-verified webhook, idempotency,
@@ -318,6 +448,14 @@ impl Aggregate for Order {
 
     fn execute(&mut self, command: Command) -> Result<Vec<Self::Event>, DomainError> {
         match command.name.as_str() {
+            CREATE_ORDER => {
+                let cmd: CreateOrder = serde_json::from_slice(&command.payload).map_err(|e| {
+                    DomainError::InvariantViolation(format!(
+                        "malformed CreateOrderCmd payload: {e}"
+                    ))
+                })?;
+                self.create_order(cmd)
+            }
             CONFIRM_PAYMENT => {
                 let cmd: ConfirmPayment =
                     serde_json::from_slice(&command.payload).map_err(|e| {
@@ -362,6 +500,159 @@ mod tests {
         ConfirmPayment::new("o-01", "pi_123")
     }
 
+    /// A command opening order `o-01` for player `p-01` from a two-SKU cart
+    /// settling in USD.
+    fn valid_create_cmd() -> CreateOrder {
+        CreateOrder::new(
+            "o-01",
+            "p-01",
+            ["sku-hoodie".to_string(), "sku-cap".to_string()],
+            "USD",
+        )
+    }
+
+    // Scenario: Successfully execute CreateOrderCmd.
+    #[test]
+    fn creates_and_emits_order_created_event() {
+        let mut order = ready_order();
+
+        let events = order
+            .execute(valid_create_cmd().into_command())
+            .expect("valid creation should succeed");
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_type(), "order.created");
+        match &events[0] {
+            Event::OrderCreated(created) => {
+                assert_eq!(created.order_id, "o-01");
+                assert_eq!(created.player_id, "p-01");
+                assert_eq!(created.line_items, vec!["sku-hoodie", "sku-cap"]);
+                assert_eq!(created.currency, "USD");
+            }
+            other => panic!("expected OrderCreated, got {other:?}"),
+        }
+        // The Order recorded the event.
+        assert_eq!(order.version(), 1);
+        assert_eq!(order.uncommitted_events().len(), 1);
+        assert_eq!(order.uncommitted_events()[0].event_type(), "order.created");
+    }
+
+    // Scenario: rejected — Payment currency is fiat via Stripe only — an Order
+    // may never settle in $MADE.
+    #[test]
+    fn create_rejects_when_currency_is_not_fiat_via_stripe() {
+        let mut order = ready_order();
+        // The Order attempts to settle in $MADE rather than fiat via Stripe.
+        order.set_currency_is_fiat_via_stripe(false);
+
+        let err = order
+            .execute(valid_create_cmd().into_command())
+            .expect_err("an Order settling in $MADE must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(order.version(), 0);
+    }
+
+    // Scenario: rejected — The order total must equal the sum of its line items.
+    #[test]
+    fn create_rejects_when_total_does_not_match_line_items() {
+        let mut order = ready_order();
+        // The order total no longer equals the sum of its line items.
+        order.set_total_matches_line_items(false);
+
+        let err = order
+            .execute(valid_create_cmd().into_command())
+            .expect_err("an Order whose total mismatches its line items must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(order.version(), 0);
+    }
+
+    // Scenario: rejected — Fulfillment occurs only after payment is confirmed via
+    // an HMAC-verified Stripe webhook.
+    #[test]
+    fn create_rejects_when_webhook_not_hmac_verified() {
+        let mut order = ready_order();
+        // The confirming webhook's HMAC signature was not verified.
+        order.set_webhook_hmac_verified(false);
+
+        let err = order
+            .execute(valid_create_cmd().into_command())
+            .expect_err("an unverified Stripe webhook must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(order.version(), 0);
+    }
+
+    // Scenario: rejected — Processing is idempotent per Stripe payment intent (no
+    // double-fulfillment).
+    #[test]
+    fn create_rejects_when_payment_intent_already_processed() {
+        let mut order = ready_order();
+        // This payment intent has already been processed once.
+        order.set_payment_intent_already_processed(true);
+
+        let err = order
+            .execute(valid_create_cmd().into_command())
+            .expect_err("an already-processed payment intent must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(order.version(), 0);
+    }
+
+    // Scenario: rejected — A refund reverses exactly the entitlements the order
+    // granted.
+    #[test]
+    fn create_rejects_when_refund_does_not_reverse_exactly() {
+        let mut order = ready_order();
+        // The refund/entitlement ledger is out of balance.
+        order.set_refund_reverses_exactly(false);
+
+        let err = order
+            .execute(valid_create_cmd().into_command())
+            .expect_err("an out-of-balance refund ledger must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(order.version(), 0);
+    }
+
+    // A CreateOrderCmd naming a different Order is rejected before any invariant
+    // runs.
+    #[test]
+    fn create_rejects_command_for_a_different_order() {
+        let mut order = ready_order();
+        let cmd = CreateOrder::new("o-99", "p-01", ["sku-cap".to_string()], "USD");
+
+        let err = order
+            .execute(cmd.into_command())
+            .expect_err("a command for another order must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(order.version(), 0);
+    }
+
+    // CreateOrderCmd missing any required field (playerId, lineItems, currency,
+    // or an empty SKU) is rejected.
+    #[test]
+    fn create_rejects_command_with_missing_fields() {
+        for cmd in [
+            CreateOrder::new("o-01", "   ", ["sku-cap".to_string()], "USD"),
+            CreateOrder::new("o-01", "p-01", Vec::<String>::new(), "USD"),
+            CreateOrder::new("o-01", "p-01", ["   ".to_string()], "USD"),
+            CreateOrder::new("o-01", "p-01", ["sku-cap".to_string()], "   "),
+        ] {
+            let mut order = ready_order();
+            let err = order
+                .execute(cmd.into_command())
+                .expect_err("a command with a missing field must be rejected");
+            assert!(matches!(err, DomainError::InvariantViolation(_)));
+            assert_eq!(order.version(), 0);
+        }
+    }
+
+    #[test]
+    fn create_command_payload_round_trips() {
+        let cmd = valid_create_cmd();
+        let command = cmd.into_command();
+        assert_eq!(command.name, CreateOrder::COMMAND);
+        let decoded: CreateOrder = serde_json::from_slice(&command.payload).unwrap();
+        assert_eq!(decoded, valid_create_cmd());
+    }
+
     // Scenario: Successfully execute ConfirmPaymentCmd.
     #[test]
     fn confirms_and_emits_payment_confirmed_event() {
@@ -378,6 +669,7 @@ mod tests {
                 assert_eq!(confirmed.order_id, "o-01");
                 assert_eq!(confirmed.payment_intent_ref, "pi_123");
             }
+            other => panic!("expected PaymentConfirmed, got {other:?}"),
         }
         // The Order recorded the event.
         assert_eq!(order.version(), 1);
