@@ -1,20 +1,21 @@
 //! EmissionPool bounded context — the per-season $MADE reward pool that a
-//! season opens with a starting balance, draws down as it emits rewards, and
-//! guards with a low-pool early-warning signal, in the token-and-marketplace
-//! context.
+//! season opens with a starting balance, draws down as it emits rewards, guards
+//! with a low-pool early-warning signal, and adjusts through governance, in the
+//! token-and-marketplace context.
 //!
 //! An [`EmissionPool`] opens a competitive season's reward pool with its
 //! starting balance, emits $MADE rewards to recipients within its remaining
-//! balance, and raises a low-pool warning ahead of exhaustion. Four invariants
-//! govern opening a pool, emitting from it, and warning on it:
+//! balance, raises a low-pool warning ahead of exhaustion, and applies
+//! governance changes to its size/rate. Four invariants govern opening a pool,
+//! emitting from it, warning on it, and adjusting it:
 //!
 //! 1. **Emission schedule** — Season 1 opens with a 30M pool; each subsequent
 //!    season's pool decays by 5% of the prior schedule. A pool whose schedule
 //!    does not encode exactly that shape is rejected.
 //! 2. **Solvency / balance ceiling** — the pool can never emit more than its
 //!    remaining balance; an emission (or a pool configured to over-emit) that
-//!    would overdraw the pool, or a warning raised on an insolvent pool, is
-//!    rejected.
+//!    would overdraw the pool, a warning raised on an insolvent pool, or a size
+//!    adjustment below the remaining balance, is rejected.
 //! 3. **Advance low-pool warning** — the 50% low-pool warning must be raised at
 //!    80% depletion (advance notice), not at exhaustion; a pool whose warning is
 //!    misconfigured is rejected.
@@ -33,9 +34,13 @@
 //! (`reward.emitted`). [`RaiseLowPoolWarningCmd`] (`RaiseLowPoolWarningCmd`)
 //! validates the poolId and depletionPct, enforces the same invariants, and on
 //! success emits [`Event::LowPoolWarningRaised`] (`low.pool.warning.raised`).
-//! This module is hand-written (it does not use `shared::stub_aggregate!`) but
-//! preserves the same public surface as the scaffolded contexts: an
-//! [`EmissionPool`] aggregate and an [`EmissionPoolRepository`] port.
+//! [`AdjustPoolSizeCmd`] (`AdjustPoolSizeCmd`) validates the poolId and
+//! newParams, enforces the same invariants, applies the governance-set
+//! size/rate, and on success emits [`Event::PoolSizeAdjusted`]
+//! (`pool.size.adjusted`). This module is hand-written (it does not use
+//! `shared::stub_aggregate!`) but preserves the same public surface as the
+//! scaffolded contexts: an [`EmissionPool`] aggregate and an
+//! [`EmissionPoolRepository`] port.
 
 use serde::{Deserialize, Serialize};
 
@@ -56,6 +61,10 @@ const EMIT_REWARD: &str = "EmitRewardCmd";
 /// The command name [`EmissionPool::execute`] recognizes to raise the 50%
 /// low-pool warning at 80% depletion.
 const RAISE_LOW_POOL_WARNING: &str = "RaiseLowPoolWarningCmd";
+
+/// The command name [`EmissionPool::execute`] recognizes to apply a governance
+/// change to the pool's size/rate.
+const ADJUST_POOL_SIZE: &str = "AdjustPoolSizeCmd";
 
 /// The Season 1 pool size, in $MADE base units: the schedule opens at 30M and
 /// decays each subsequent season. A freshly constructed [`EmissionPool`] starts
@@ -242,6 +251,64 @@ pub struct PoolOpened {
     pub emission_schedule: EmissionSchedule,
 }
 
+/// The governance-supplied `newParams` for an [`AdjustPoolSizeCmd`]: the pool's
+/// new size and emission rate. Field names use the token marketplace's
+/// `camelCase` schema.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NewPoolParams {
+    /// The pool's new total size in $MADE base units; must be positive and may
+    /// never be set below the pool's remaining balance.
+    pub new_size: u64,
+    /// The pool's new emission rate (base units per draw-down step); must be
+    /// positive.
+    pub new_rate: u64,
+}
+
+impl NewPoolParams {
+    /// Build a `newParams` carrying a `new_size` and `new_rate`.
+    pub fn new(new_size: u64, new_rate: u64) -> Self {
+        Self { new_size, new_rate }
+    }
+}
+
+/// The `AdjustPoolSizeCmd` payload: which pool to adjust and the governance
+/// `newParams` (size/rate) to apply. Field names use the token marketplace's
+/// `camelCase` schema.
+///
+/// Build one directly and turn it into a [`Command`] with
+/// [`AdjustPoolSizeCmd::into_command`], or decode it from a command payload via
+/// [`serde_json`] inside [`EmissionPool::execute`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AdjustPoolSizeCmd {
+    /// The pool being adjusted; must name this EmissionPool.
+    pub pool_id: String,
+    /// The governance change to apply to the pool's size/rate.
+    pub new_params: NewPoolParams,
+}
+
+impl AdjustPoolSizeCmd {
+    /// The command name this maps to.
+    pub const COMMAND: &'static str = ADJUST_POOL_SIZE;
+
+    /// Build a command applying `new_params` to `pool_id`.
+    pub fn new(pool_id: impl Into<String>, new_params: NewPoolParams) -> Self {
+        Self {
+            pool_id: pool_id.into(),
+            new_params,
+        }
+    }
+
+    /// Encode this command as a [`shared::Command`] carrying a JSON payload,
+    /// ready to hand to [`EmissionPool::execute`].
+    pub fn into_command(&self) -> Command {
+        // Serialization of a plain data struct to a Vec cannot fail here.
+        let payload = serde_json::to_vec(self).expect("AdjustPoolSizeCmd is always serializable");
+        Command::with_payload(Self::COMMAND, payload)
+    }
+}
+
 /// The reward that was emitted, carried by [`Event::RewardEmitted`] and thus by
 /// the emitted `reward.emitted` event.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -267,6 +334,21 @@ pub struct LowPoolWarningRaised {
     pub depletion_pct: u8,
 }
 
+/// The governance change that was applied, carried by
+/// [`Event::PoolSizeAdjusted`] and thus by the emitted `pool.size.adjusted`
+/// event.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PoolSizeAdjusted {
+    /// The pool whose size/rate was adjusted.
+    pub pool_id: String,
+    /// The pool's size before the adjustment was applied.
+    pub previous_size: u64,
+    /// The pool's new total size in $MADE base units.
+    pub new_size: u64,
+    /// The pool's new emission rate.
+    pub new_rate: u64,
+}
+
 /// Domain events emitted by [`EmissionPool`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Event {
@@ -276,6 +358,8 @@ pub enum Event {
     RewardEmitted(RewardEmitted),
     /// The 50% low-pool warning was raised at 80% depletion.
     LowPoolWarningRaised(LowPoolWarningRaised),
+    /// A governance change to the pool's size/rate was applied.
+    PoolSizeAdjusted(PoolSizeAdjusted),
 }
 
 impl DomainEvent for Event {
@@ -284,12 +368,14 @@ impl DomainEvent for Event {
             Event::PoolOpened(_) => "emission.pool.opened",
             Event::RewardEmitted(_) => "reward.emitted",
             Event::LowPoolWarningRaised(_) => "low.pool.warning.raised",
+            Event::PoolSizeAdjusted(_) => "pool.size.adjusted",
         }
     }
 }
 
 /// The EmissionPool aggregate: one season's $MADE emission pool — the reward
-/// budget a season opens with, draws down, and guards with a low-pool warning.
+/// budget a season opens with, draws down, guards with a low-pool warning, and
+/// adjusts through governance.
 ///
 /// Mirrors the shape produced by [`shared::stub_aggregate!`] (identity plus an
 /// embedded [`AggregateRoot`]) so surrounding wiring stays consistent, while it
@@ -304,6 +390,9 @@ pub struct EmissionPool {
     /// The emission schedule the pool follows; must be the canonical 30M /
     /// 5%-decay schedule.
     emission_schedule: EmissionSchedule,
+    /// The pool's governance-set total size in $MADE base units. Adjusted by
+    /// [`AdjustPoolSizeCmd`] and never set below the remaining balance.
+    pool_size: u64,
     /// The $MADE remaining in the pool; an emission may never exceed it.
     remaining_balance: u64,
     /// Whether the pool can only ever emit within its remaining balance.
@@ -336,6 +425,7 @@ impl EmissionPool {
             id: id.into(),
             root: AggregateRoot::new(),
             emission_schedule: EmissionSchedule::canonical(),
+            pool_size: SEASON_ONE_POOL,
             remaining_balance: SEASON_ONE_POOL,
             emits_within_balance: true,
             low_pool_warning_in_advance: true,
@@ -359,6 +449,17 @@ impl EmissionPool {
     /// Events produced but not yet persisted.
     pub fn uncommitted_events(&self) -> &[Box<dyn DomainEvent>] {
         self.root.uncommitted_events()
+    }
+
+    /// The pool's governance-set total size.
+    pub fn pool_size(&self) -> u64 {
+        self.pool_size
+    }
+
+    /// Set the pool's governance-set total size (used to model a pool adjusted
+    /// to a particular size before a command runs).
+    pub fn set_pool_size(&mut self, size: u64) {
+        self.pool_size = size;
     }
 
     /// The $MADE remaining in the pool.
@@ -540,6 +641,20 @@ impl EmissionPool {
         Ok(())
     }
 
+    /// Balance invariant for a size adjustment: the pool can never emit more than
+    /// its remaining balance, so its governance-set size may never be reduced
+    /// below the $MADE still held in the pool.
+    fn ensure_new_size_covers_remaining_balance(&self, new_size: u64) -> Result<(), DomainError> {
+        if new_size < self.remaining_balance {
+            return Err(DomainError::InvariantViolation(format!(
+                "emission pool '{}' cannot be resized to {new_size} $MADE; the pool can never \
+                 emit more than its remaining balance of {}, so its size may not drop below it",
+                self.id, self.remaining_balance
+            )));
+        }
+        Ok(())
+    }
+
     // -- Command handlers --------------------------------------------------
 
     /// Handle `OpenEmissionPoolCmd`: verify the command carries a valid seasonId
@@ -661,6 +776,55 @@ impl EmissionPool {
         self.root.record(Box::new(event.clone()));
         Ok(vec![event])
     }
+
+    /// Handle `AdjustPoolSizeCmd`: verify the command carries a valid poolId
+    /// (naming this EmissionPool) and newParams; enforce every emission-pool
+    /// invariant; apply the governance-set size/rate; and emit
+    /// [`Event::PoolSizeAdjusted`].
+    fn adjust_pool_size(&mut self, cmd: AdjustPoolSizeCmd) -> Result<Vec<Event>, DomainError> {
+        if cmd.pool_id.trim().is_empty() {
+            return Err(DomainError::InvariantViolation(format!(
+                "emission pool '{}' requires a valid poolId to adjust the pool size",
+                self.id
+            )));
+        }
+        if cmd.new_params.new_size == 0 {
+            return Err(DomainError::InvariantViolation(format!(
+                "emission pool '{}' requires a positive newParams.newSize to adjust the pool size",
+                self.id
+            )));
+        }
+        if cmd.new_params.new_rate == 0 {
+            return Err(DomainError::InvariantViolation(format!(
+                "emission pool '{}' requires a positive newParams.newRate to adjust the pool size",
+                self.id
+            )));
+        }
+        if cmd.pool_id != self.id {
+            return Err(DomainError::InvariantViolation(format!(
+                "command targets emission pool '{}' but this aggregate is emission pool '{}'",
+                cmd.pool_id, self.id
+            )));
+        }
+
+        self.ensure_emission_schedule_valid()?;
+        self.ensure_new_size_covers_remaining_balance(cmd.new_params.new_size)?;
+        self.ensure_low_pool_warning_valid()?;
+        self.ensure_governance_schedule_valid()?;
+
+        // Apply the governance change to the pool's size.
+        let previous_size = self.pool_size;
+        self.pool_size = cmd.new_params.new_size;
+
+        let event = Event::PoolSizeAdjusted(PoolSizeAdjusted {
+            pool_id: cmd.pool_id,
+            previous_size,
+            new_size: cmd.new_params.new_size,
+            new_rate: cmd.new_params.new_rate,
+        });
+        self.root.record(Box::new(event.clone()));
+        Ok(vec![event])
+    }
 }
 
 impl Aggregate for EmissionPool {
@@ -695,6 +859,15 @@ impl Aggregate for EmissionPool {
                         ))
                     })?;
                 self.raise_low_pool_warning(cmd)
+            }
+            ADJUST_POOL_SIZE => {
+                let cmd: AdjustPoolSizeCmd =
+                    serde_json::from_slice(&command.payload).map_err(|e| {
+                        DomainError::InvariantViolation(format!(
+                            "malformed AdjustPoolSizeCmd payload: {e}"
+                        ))
+                    })?;
+                self.adjust_pool_size(cmd)
             }
             // Any other command is unknown to this aggregate.
             _ => Err(DomainError::unknown_command(
@@ -1196,5 +1369,179 @@ mod tests {
         assert_eq!(command.name, RaiseLowPoolWarningCmd::COMMAND);
         let decoded: RaiseLowPoolWarningCmd = serde_json::from_slice(&command.payload).unwrap();
         assert_eq!(decoded, valid_warning_cmd());
+    }
+
+    // --- AdjustPoolSizeCmd ---------------------------------------------------
+
+    /// A ready pool that has drawn Season 1 down to 10M, so a governance
+    /// adjustment to a 15M Season 2 size is representable.
+    fn drained_pool() -> EmissionPool {
+        let mut pool = ready_pool();
+        pool.set_remaining_balance(10_000_000);
+        pool
+    }
+
+    /// A command adjusting `pool-01` to a 15M size at a 500K rate.
+    fn valid_adjust_cmd() -> AdjustPoolSizeCmd {
+        AdjustPoolSizeCmd::new("pool-01", NewPoolParams::new(15_000_000, 500_000))
+    }
+
+    // Scenario: Successfully execute AdjustPoolSizeCmd.
+    #[test]
+    fn adjusts_and_records_pool_size_adjusted_event() {
+        let mut pool = drained_pool();
+
+        let events = pool
+            .execute(valid_adjust_cmd().into_command())
+            .expect("valid adjustment should succeed");
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_type(), "pool.size.adjusted");
+        match &events[0] {
+            Event::PoolSizeAdjusted(adjusted) => {
+                assert_eq!(adjusted.pool_id, "pool-01");
+                assert_eq!(adjusted.previous_size, SEASON_ONE_POOL);
+                assert_eq!(adjusted.new_size, 15_000_000);
+                assert_eq!(adjusted.new_rate, 500_000);
+            }
+            other => panic!("expected PoolSizeAdjusted, got {other:?}"),
+        }
+        // The governance-set size was applied.
+        assert_eq!(pool.pool_size(), 15_000_000);
+        // The EmissionPool recorded the event and advanced its version.
+        assert_eq!(pool.version(), 1);
+        assert_eq!(pool.uncommitted_events().len(), 1);
+        assert_eq!(
+            pool.uncommitted_events()[0].event_type(),
+            "pool.size.adjusted"
+        );
+    }
+
+    // Scenario: rejected - Season 1 opens with a 30M pool; each subsequent
+    // season's pool halves by the mandated schedule.
+    #[test]
+    fn adjust_rejects_when_emission_schedule_is_invalid() {
+        let mut pool = drained_pool();
+        pool.set_emission_schedule_valid(false);
+
+        let err = pool
+            .execute(valid_adjust_cmd().into_command())
+            .expect_err("an invalid emission schedule must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(pool.version(), 0);
+        // A rejected adjustment leaves the size untouched.
+        assert_eq!(pool.pool_size(), SEASON_ONE_POOL);
+    }
+
+    // Scenario: rejected - The pool can never emit more than its remaining
+    // balance.
+    #[test]
+    fn adjust_rejects_when_new_size_is_below_remaining_balance() {
+        let mut pool = ready_pool();
+        // 30M still held, but governance tries to shrink the pool to 15M.
+        pool.set_remaining_balance(30_000_000);
+
+        let err = pool
+            .execute(valid_adjust_cmd().into_command())
+            .expect_err("resizing below the remaining balance must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(pool.version(), 0);
+        assert_eq!(pool.pool_size(), SEASON_ONE_POOL);
+    }
+
+    // Scenario: rejected - The low-pool warning must be raised at 80% depletion
+    // (advance notice), not at exhaustion.
+    #[test]
+    fn adjust_rejects_when_low_pool_warning_is_misconfigured() {
+        let mut pool = drained_pool();
+        pool.set_low_pool_warning_valid(false);
+
+        let err = pool
+            .execute(valid_adjust_cmd().into_command())
+            .expect_err("a misconfigured low-pool warning must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(pool.version(), 0);
+    }
+
+    // Scenario: rejected - Pool size is a governance-adjustable parameter; a
+    // later season cannot open until the prior season's drain is understood.
+    #[test]
+    fn adjust_rejects_when_governance_gate_is_unresolved() {
+        let mut pool = drained_pool();
+        pool.set_governance_schedule_valid(false);
+
+        let err = pool
+            .execute(valid_adjust_cmd().into_command())
+            .expect_err("an unresolved governance gate must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(pool.version(), 0);
+    }
+
+    // An adjustment to exactly the remaining balance is allowed (the floor is
+    // inclusive).
+    #[test]
+    fn adjusts_to_exactly_the_remaining_balance() {
+        let mut pool = ready_pool();
+        pool.set_remaining_balance(15_000_000);
+
+        let events = pool
+            .execute(valid_adjust_cmd().into_command())
+            .expect("resizing to exactly the remaining balance should succeed");
+        assert_eq!(events.len(), 1);
+        assert_eq!(pool.pool_size(), 15_000_000);
+    }
+
+    // A command naming a different pool is rejected before any invariant runs.
+    #[test]
+    fn adjust_rejects_command_for_a_different_pool() {
+        let mut pool = drained_pool();
+        let cmd = AdjustPoolSizeCmd::new("pool-99", NewPoolParams::new(15_000_000, 500_000));
+
+        let err = pool
+            .execute(cmd.into_command())
+            .expect_err("a command for another pool must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(pool.version(), 0);
+    }
+
+    // Commands with a non-positive newParams field are rejected.
+    #[test]
+    fn adjust_rejects_command_with_invalid_new_params() {
+        for cmd in [
+            AdjustPoolSizeCmd::new("   ", NewPoolParams::new(15_000_000, 500_000)),
+            AdjustPoolSizeCmd::new("pool-01", NewPoolParams::new(0, 500_000)),
+            AdjustPoolSizeCmd::new("pool-01", NewPoolParams::new(15_000_000, 0)),
+        ] {
+            let mut pool = drained_pool();
+            let err = pool
+                .execute(cmd.into_command())
+                .expect_err("a command with invalid newParams must be rejected");
+            assert!(matches!(err, DomainError::InvariantViolation(_)));
+            assert_eq!(pool.version(), 0);
+        }
+    }
+
+    // A malformed payload for a recognized command is a domain error, not a panic.
+    #[test]
+    fn rejects_malformed_adjust_pool_size_payload() {
+        let mut pool = drained_pool();
+
+        let err = pool
+            .execute(Command::with_payload(
+                ADJUST_POOL_SIZE,
+                b"not json".to_vec(),
+            ))
+            .expect_err("malformed payload must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(pool.version(), 0);
+    }
+
+    #[test]
+    fn adjust_pool_size_command_payload_round_trips() {
+        let cmd = valid_adjust_cmd();
+        let command = cmd.into_command();
+        assert_eq!(command.name, AdjustPoolSizeCmd::COMMAND);
+        let decoded: AdjustPoolSizeCmd = serde_json::from_slice(&command.payload).unwrap();
+        assert_eq!(decoded, valid_adjust_cmd());
     }
 }
