@@ -15,10 +15,16 @@
 //!
 //! [`MintCardTokenCmd`] (`MintCardTokenCmd`) validates the target token,
 //! staged metadata reference, and serial number, enforces every invariant, and
-//! on success emits [`Event::CardTokenMinted`] (`card.token.minted`). This
-//! module is hand-written (it does not use `shared::stub_aggregate!`) but
-//! preserves the same public surface as the scaffolded contexts: a
-//! [`CardToken`] aggregate and a [`CardTokenRepository`] port.
+//! on success emits [`Event::CardTokenMinted`] (`card.token.minted`).
+//!
+//! [`StageMetadataCmd`] (`StageMetadataCmd`) pins a card's metadata record to
+//! IPFS for a tokenId: it validates the target token, the metadata record
+//! (name, cost, art URL, effect ref), and the serialized edition's serial
+//! number, enforces the same four invariants, and on success emits
+//! [`Event::MetadataStaged`] (`metadata.staged`). This module is hand-written
+//! (it does not use `shared::stub_aggregate!`) but preserves the same public
+//! surface as the scaffolded contexts: a [`CardToken`] aggregate and a
+//! [`CardTokenRepository`] port.
 
 use serde::{Deserialize, Serialize};
 
@@ -31,6 +37,10 @@ const AGGREGATE_TYPE: &str = "CardToken";
 /// The command name [`CardToken::execute`] recognizes to mint an ERC-1155 card
 /// token with staged metadata.
 const MINT_CARD_TOKEN: &str = "MintCardTokenCmd";
+
+/// The command name [`CardToken::execute`] recognizes to pin (stage) a card's
+/// metadata record to IPFS for a tokenId.
+const STAGE_METADATA: &str = "StageMetadataCmd";
 
 /// The `MintCardTokenCmd` payload: which token is being minted, which staged
 /// IPFS metadata record it resolves to, and the serialized cosmetic edition's
@@ -89,17 +99,119 @@ pub struct CardTokenMinted {
     pub serial_number: String,
 }
 
+/// The IPFS metadata record staged for a tokenId. Every tokenId must map to a
+/// resolvable record carrying all four card render and rules fields. Field
+/// names use the token marketplace's `camelCase` schema.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StagedMetadata {
+    /// Display name of the card.
+    pub name: String,
+    /// Play cost of the card.
+    pub cost: u32,
+    /// URL of the card art asset.
+    pub art_url: String,
+    /// Reference to the card's effect/rules definition.
+    pub effect_ref: String,
+}
+
+impl StagedMetadata {
+    /// Build a staged metadata record.
+    pub fn new(
+        name: impl Into<String>,
+        cost: u32,
+        art_url: impl Into<String>,
+        effect_ref: impl Into<String>,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            cost,
+            art_url: art_url.into(),
+            effect_ref: effect_ref.into(),
+        }
+    }
+
+    /// Whether every required field resolves to a non-empty value. `cost` is a
+    /// numeric field and may legitimately be zero.
+    fn is_resolvable(&self) -> bool {
+        !self.name.trim().is_empty()
+            && !self.art_url.trim().is_empty()
+            && !self.effect_ref.trim().is_empty()
+    }
+}
+
+/// The `StageMetadataCmd` payload: which token is being staged, the IPFS
+/// metadata record it resolves to, and the serialized cosmetic edition's serial
+/// number. Field names use the token marketplace's `camelCase` schema.
+///
+/// Build one directly and turn it into a [`Command`] with
+/// [`StageMetadataCmd::into_command`], or decode it from a command payload via
+/// [`serde_json`] inside [`CardToken::execute`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StageMetadataCmd {
+    /// The ERC-1155 token whose metadata is being staged; must name this
+    /// CardToken.
+    pub token_id: String,
+    /// The IPFS metadata record to pin for the token.
+    pub metadata: StagedMetadata,
+    /// Unique, non-reusable serial number for the cosmetic edition.
+    pub serial_number: String,
+}
+
+impl StageMetadataCmd {
+    /// The command name this maps to.
+    pub const COMMAND: &'static str = STAGE_METADATA;
+
+    /// Build a command staging `metadata` for `token_id` under cosmetic edition
+    /// `serial_number`.
+    pub fn new(
+        token_id: impl Into<String>,
+        metadata: StagedMetadata,
+        serial_number: impl Into<String>,
+    ) -> Self {
+        Self {
+            token_id: token_id.into(),
+            metadata,
+            serial_number: serial_number.into(),
+        }
+    }
+
+    /// Encode this command as a [`shared::Command`] carrying a JSON payload,
+    /// ready to hand to [`CardToken::execute`].
+    pub fn into_command(&self) -> Command {
+        // Serialization of a plain data struct to a Vec cannot fail here.
+        let payload = serde_json::to_vec(self).expect("StageMetadataCmd is always serializable");
+        Command::with_payload(Self::COMMAND, payload)
+    }
+}
+
+/// The metadata that was staged, carried by [`Event::MetadataStaged`] and thus
+/// by the emitted `metadata.staged` event.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MetadataStaged {
+    /// The ERC-1155 token whose metadata was staged.
+    pub token_id: String,
+    /// The IPFS metadata record pinned for the token.
+    pub metadata: StagedMetadata,
+    /// Serialized cosmetic edition serial number.
+    pub serial_number: String,
+}
+
 /// Domain events emitted by [`CardToken`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Event {
     /// An ERC-1155 card token was minted with staged metadata.
     CardTokenMinted(CardTokenMinted),
+    /// A card's IPFS metadata record was staged (pinned) for its tokenId.
+    MetadataStaged(MetadataStaged),
 }
 
 impl DomainEvent for Event {
     fn event_type(&self) -> &'static str {
         match self {
             Event::CardTokenMinted(_) => "card.token.minted",
+            Event::MetadataStaged(_) => "metadata.staged",
         }
     }
 }
@@ -281,6 +393,52 @@ impl CardToken {
         self.root.record(Box::new(event.clone()));
         Ok(vec![event])
     }
+
+    /// Handle `StageMetadataCmd`: verify the command carries a valid tokenId
+    /// (naming this CardToken), a resolvable metadata record, and a serial
+    /// number; enforce every token marketplace invariant; mark the serial number
+    /// consumed; and emit [`Event::MetadataStaged`].
+    fn stage_metadata(&mut self, cmd: StageMetadataCmd) -> Result<Vec<Event>, DomainError> {
+        if cmd.token_id.trim().is_empty() {
+            return Err(DomainError::InvariantViolation(format!(
+                "card token '{}' requires a valid tokenId to stage metadata",
+                self.id
+            )));
+        }
+        if !cmd.metadata.is_resolvable() {
+            return Err(DomainError::InvariantViolation(format!(
+                "card token '{}' requires a resolvable metadata record (name, cost, art URL, effect ref) to stage",
+                self.id
+            )));
+        }
+        if cmd.serial_number.trim().is_empty() {
+            return Err(DomainError::InvariantViolation(format!(
+                "card token '{}' requires a valid serialNumber to stage metadata",
+                self.id
+            )));
+        }
+        if cmd.token_id != self.id {
+            return Err(DomainError::InvariantViolation(format!(
+                "command targets card token '{}' but this aggregate is card token '{}'",
+                cmd.token_id, self.id
+            )));
+        }
+
+        self.ensure_ownership_verified_server_authoritatively()?;
+        self.ensure_ipfs_metadata_record_resolvable()?;
+        self.ensure_serial_number_unused(&cmd.serial_number)?;
+        self.ensure_on_chain_ownership_verified_for_render()?;
+
+        self.used_serial_numbers.push(cmd.serial_number.clone());
+
+        let event = Event::MetadataStaged(MetadataStaged {
+            token_id: cmd.token_id,
+            metadata: cmd.metadata,
+            serial_number: cmd.serial_number,
+        });
+        self.root.record(Box::new(event.clone()));
+        Ok(vec![event])
+    }
 }
 
 impl Aggregate for CardToken {
@@ -300,6 +458,15 @@ impl Aggregate for CardToken {
                         ))
                     })?;
                 self.mint_card_token(cmd)
+            }
+            STAGE_METADATA => {
+                let cmd: StageMetadataCmd =
+                    serde_json::from_slice(&command.payload).map_err(|e| {
+                        DomainError::InvariantViolation(format!(
+                            "malformed StageMetadataCmd payload: {e}"
+                        ))
+                    })?;
+                self.stage_metadata(cmd)
             }
             // Any other command is unknown to this aggregate.
             _ => Err(DomainError::unknown_command(
@@ -352,6 +519,7 @@ mod tests {
                 assert_eq!(minted.ipfs_metadata_ref, "ipfs://metadata/token-01");
                 assert_eq!(minted.serial_number, "SN-0001");
             }
+            other => panic!("expected CardTokenMinted, got {other:?}"),
         }
         // The CardToken recorded the event and consumed the serial number.
         assert_eq!(token.version(), 1);
@@ -489,5 +657,161 @@ mod tests {
         assert_eq!(command.name, MintCardTokenCmd::COMMAND);
         let decoded: MintCardTokenCmd = serde_json::from_slice(&command.payload).unwrap();
         assert_eq!(decoded, valid_cmd());
+    }
+
+    // ---- StageMetadataCmd (S-61) --------------------------------------------
+
+    /// A resolvable metadata record for `token-01`.
+    fn valid_metadata() -> StagedMetadata {
+        StagedMetadata::new(
+            "Ember Drake",
+            4,
+            "ipfs://art/token-01",
+            "effect://ember-drake",
+        )
+    }
+
+    /// A command staging valid metadata for `token-01` under serial `SN-0001`.
+    fn valid_stage_cmd() -> StageMetadataCmd {
+        StageMetadataCmd::new("token-01", valid_metadata(), "SN-0001")
+    }
+
+    // Scenario: Successfully execute StageMetadataCmd.
+    #[test]
+    fn stages_and_emits_metadata_staged_event() {
+        let mut token = ready_token();
+
+        let events = token
+            .execute(valid_stage_cmd().into_command())
+            .expect("valid stage should succeed");
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_type(), "metadata.staged");
+        match &events[0] {
+            Event::MetadataStaged(staged) => {
+                assert_eq!(staged.token_id, "token-01");
+                assert_eq!(staged.metadata, valid_metadata());
+                assert_eq!(staged.serial_number, "SN-0001");
+            }
+            other => panic!("expected MetadataStaged, got {other:?}"),
+        }
+        assert_eq!(token.version(), 1);
+        assert_eq!(token.uncommitted_events().len(), 1);
+        assert_eq!(
+            token.uncommitted_events()[0].event_type(),
+            "metadata.staged"
+        );
+    }
+
+    // Scenario: rejected - Ownership is verified server-authoritatively at match
+    // start; client-asserted ownership is never trusted.
+    #[test]
+    fn stage_rejects_when_ownership_not_server_authoritative() {
+        let mut token = ready_token();
+        token.set_ownership_verified_server_authoritatively(false);
+
+        let err = token
+            .execute(valid_stage_cmd().into_command())
+            .expect_err("client-asserted ownership must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(token.version(), 0);
+    }
+
+    // Scenario: rejected - Every tokenId maps to a resolvable IPFS metadata
+    // record (name, cost, art URL, effect ref).
+    #[test]
+    fn stage_rejects_when_ipfs_metadata_record_is_not_resolvable() {
+        let mut token = ready_token();
+        token.set_ipfs_metadata_record_resolvable(false);
+
+        let err = token
+            .execute(valid_stage_cmd().into_command())
+            .expect_err("unresolvable staged metadata must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(token.version(), 0);
+    }
+
+    // Scenario: rejected - Serialized cosmetic editions carry a unique,
+    // non-reusable serial number.
+    #[test]
+    fn stage_rejects_when_serial_number_was_already_used() {
+        let mut token = ready_token();
+        token.record_used_serial_number("SN-0001");
+
+        let err = token
+            .execute(valid_stage_cmd().into_command())
+            .expect_err("a reused serial number must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(token.version(), 0);
+    }
+
+    // Scenario: rejected - A cosmetic renders on-face only after verified
+    // on-chain ownership.
+    #[test]
+    fn stage_rejects_when_on_chain_ownership_not_verified_for_render() {
+        let mut token = ready_token();
+        token.set_on_chain_ownership_verified_for_render(false);
+
+        let err = token
+            .execute(valid_stage_cmd().into_command())
+            .expect_err("unverified on-chain ownership must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(token.version(), 0);
+    }
+
+    // A stage command naming a different CardToken is rejected before any
+    // invariant runs.
+    #[test]
+    fn stage_rejects_command_for_a_different_token() {
+        let mut token = ready_token();
+        let cmd = StageMetadataCmd::new("token-99", valid_metadata(), "SN-0001");
+
+        let err = token
+            .execute(cmd.into_command())
+            .expect_err("a command for another token must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(token.version(), 0);
+    }
+
+    // Stage commands missing any required field (including an unresolvable
+    // metadata record) are rejected.
+    #[test]
+    fn stage_rejects_command_with_missing_fields() {
+        let cmds = [
+            StageMetadataCmd::new("   ", valid_metadata(), "SN-0001"),
+            StageMetadataCmd::new(
+                "token-01",
+                StagedMetadata::new("  ", 4, "ipfs://art", "eff"),
+                "SN-0001",
+            ),
+            StageMetadataCmd::new(
+                "token-01",
+                StagedMetadata::new("Ember", 4, "  ", "eff"),
+                "SN-0001",
+            ),
+            StageMetadataCmd::new(
+                "token-01",
+                StagedMetadata::new("Ember", 4, "ipfs://art", "  "),
+                "SN-0001",
+            ),
+            StageMetadataCmd::new("token-01", valid_metadata(), "   "),
+        ];
+        for cmd in cmds {
+            let mut token = ready_token();
+            let err = token
+                .execute(cmd.into_command())
+                .expect_err("a command with a missing field must be rejected");
+            assert!(matches!(err, DomainError::InvariantViolation(_)));
+            assert_eq!(token.version(), 0);
+        }
+    }
+
+    #[test]
+    fn stage_command_payload_round_trips() {
+        let cmd = valid_stage_cmd();
+        let command = cmd.into_command();
+        assert_eq!(command.name, StageMetadataCmd::COMMAND);
+        let decoded: StageMetadataCmd = serde_json::from_slice(&command.payload).unwrap();
+        assert_eq!(decoded, valid_stage_cmd());
     }
 }
