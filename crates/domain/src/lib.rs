@@ -13,6 +13,7 @@ pub mod card_pack;
 pub mod expansion_set;
 pub mod match_replay;
 pub mod matchmaking_ticket;
+pub mod mission_attempt;
 pub mod order;
 pub mod outfit;
 pub mod player_collection;
