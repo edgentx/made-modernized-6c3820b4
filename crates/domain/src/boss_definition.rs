@@ -15,14 +15,17 @@
 //! 4. **Authoritative roster** — the published roster must contain *exactly*
 //!    [`AUTHORITATIVE_ROSTER_SIZE`] Bosses before a launch is validated.
 //!
-//! The only command implemented so far is [`AssignSignatureCards`]
-//! (`AssignSignatureCardsCmd`): it binds a Boss's signature card set from valid
-//! card definitions, enforcing all four invariants, and on success emits
-//! [`Event::SignatureAssigned`] (`boss.signature.assigned`). This module is
-//! hand-written (it no longer uses `shared::stub_aggregate!`) but preserves the
-//! same public surface — a [`BossDefinition`] aggregate and a
-//! [`BossDefinitionRepository`] port — so the persistence adapters in
-//! `crates/mocks` keep compiling unchanged.
+//! Two commands are implemented. [`DefineBoss`] (`DefineBossCmd`) creates a Boss
+//! definition — its name, starting HP, single hero power and single trademark,
+//! plus the signature card set it is launched with — enforcing all four
+//! invariants and, on success, emitting [`Event::BossDefined`] (`boss.defined`).
+//! [`AssignSignatureCards`] (`AssignSignatureCardsCmd`) rebinds a Boss's
+//! signature card set from valid card definitions, enforcing the same four
+//! invariants, and on success emits [`Event::SignatureAssigned`]
+//! (`boss.signature.assigned`). This module is hand-written (it no longer uses
+//! `shared::stub_aggregate!`) but preserves the same public surface — a
+//! [`BossDefinition`] aggregate and a [`BossDefinitionRepository`] port — so the
+//! persistence adapters in `crates/mocks` keep compiling unchanged.
 
 use std::collections::BTreeSet;
 
@@ -33,6 +36,9 @@ use shared::{Aggregate, AggregateRoot, Command, DomainError, DomainEvent, Reposi
 /// Stable aggregate type name, surfaced in [`DomainError::UnknownCommand`] and
 /// used for command routing.
 const AGGREGATE_TYPE: &str = "BossDefinition";
+
+/// The command name [`BossDefinition::execute`] recognizes for defining a Boss.
+const DEFINE_BOSS: &str = "DefineBossCmd";
 
 /// The command name [`BossDefinition::execute`] recognizes.
 const ASSIGN_SIGNATURE_CARDS: &str = "AssignSignatureCardsCmd";
@@ -47,6 +53,68 @@ pub const LEGAL_STARTING_HP: std::ops::RangeInclusive<i64> = 30..=90;
 /// The authoritative roster size: the published roster must contain exactly this
 /// many Bosses before a launch is validated.
 pub const AUTHORITATIVE_ROSTER_SIZE: usize = 18;
+
+/// The `DefineBossCmd` payload: a proposed Boss definition in its raw,
+/// as-submitted form. Field names are the catalog's `camelCase` schema.
+///
+/// The hero powers and trademarks are carried as lists so the "exactly one"
+/// signature-shape invariant can reject a definition that supplies none or more
+/// than one of either — mirroring the aggregate's own `hero_powers`/`trademarks`
+/// modeling. A well-formed definition supplies a single-element list for each.
+///
+/// Build one directly and turn it into a [`Command`] with
+/// [`DefineBoss::into_command`], or decode it from a command payload via
+/// [`serde_json`] inside [`BossDefinition::execute`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DefineBoss {
+    /// Identity the Boss is cataloged under; must name the Boss this aggregate
+    /// records.
+    pub boss_id: String,
+    /// Human-readable Boss name.
+    pub name: String,
+    /// Starting HP; must fall within [`LEGAL_STARTING_HP`].
+    pub starting_hp: i64,
+    /// The hero powers declared on the Boss. Exactly one is legal.
+    pub hero_powers: Vec<String>,
+    /// The trademarks declared on the Boss. Exactly one is legal.
+    pub trademarks: Vec<String>,
+    /// The signature card set to launch the Boss with. Must be non-empty and
+    /// every id must resolve to a valid card definition in the catalog.
+    pub signature_card_ids: Vec<String>,
+}
+
+impl DefineBoss {
+    /// The command name this maps to.
+    pub const COMMAND: &'static str = DEFINE_BOSS;
+
+    /// Encode this command as a [`shared::Command`] carrying a JSON payload,
+    /// ready to hand to [`BossDefinition::execute`].
+    pub fn into_command(&self) -> Command {
+        // Serialization of a plain data struct to a Vec cannot fail here.
+        let payload = serde_json::to_vec(self).expect("DefineBoss is always serializable");
+        Command::with_payload(Self::COMMAND, payload)
+    }
+}
+
+/// A validated Boss definition, produced once every invariant has been checked.
+/// Carried by [`Event::BossDefined`] and thus by the emitted `boss.defined`
+/// event; the single hero power and trademark are the proven-legal values.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BossDefined {
+    /// The Boss that was defined.
+    pub boss_id: String,
+    /// The Boss's name.
+    pub name: String,
+    /// The Boss's proven-legal starting HP.
+    pub starting_hp: i64,
+    /// The Boss's single hero power.
+    pub hero_power: String,
+    /// The Boss's single trademark.
+    pub trademark: String,
+    /// The signature card set the Boss was defined with.
+    pub signature_card_ids: Vec<String>,
+}
 
 /// The `AssignSignatureCardsCmd` payload: the Boss to bind and the signature
 /// card set to bind to it. Field names are the catalog's `camelCase` schema.
@@ -101,6 +169,8 @@ pub struct SignatureAssigned {
 /// Domain events emitted by [`BossDefinition`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Event {
+    /// A Boss definition passed every invariant and was added to the catalog.
+    BossDefined(BossDefined),
     /// A Boss's signature card set passed every invariant and was bound.
     SignatureAssigned(SignatureAssigned),
 }
@@ -108,6 +178,7 @@ pub enum Event {
 impl DomainEvent for Event {
     fn event_type(&self) -> &'static str {
         match self {
+            Event::BossDefined(_) => "boss.defined",
             Event::SignatureAssigned(_) => "boss.signature.assigned",
         }
     }
@@ -287,6 +358,81 @@ impl BossDefinition {
         Ok(())
     }
 
+    /// Handle `DefineBossCmd`: verify the command targets this Boss, enforce all
+    /// four invariants against the proposed definition, commit the definitional
+    /// fields to aggregate state, and emit [`Event::BossDefined`].
+    ///
+    /// The Boss's definitional fields (name, HP, hero power, trademark, signature
+    /// set) arrive on the command; the catalog of valid cards and the published
+    /// roster size are aggregate configuration. Every invariant is checked before
+    /// any state is mutated, so a rejected command leaves the aggregate untouched.
+    fn define_boss(&mut self, cmd: DefineBoss) -> Result<Vec<Event>, DomainError> {
+        // The command must name the Boss this aggregate actually records.
+        if cmd.boss_id != self.boss_id {
+            return Err(DomainError::InvariantViolation(format!(
+                "command targets Boss '{}' but this aggregate records '{}'",
+                cmd.boss_id, self.boss_id
+            )));
+        }
+
+        if cmd.name.trim().is_empty() {
+            return Err(DomainError::InvariantViolation(
+                "a Boss must have a non-empty name".to_string(),
+            ));
+        }
+
+        // Signature-shape invariant: exactly one hero power and exactly one
+        // trademark on the proposed definition.
+        if cmd.hero_powers.len() != 1 {
+            return Err(DomainError::InvariantViolation(format!(
+                "every Boss has exactly one hero power; Boss '{}' declares {}",
+                cmd.boss_id,
+                cmd.hero_powers.len()
+            )));
+        }
+        if cmd.trademarks.len() != 1 {
+            return Err(DomainError::InvariantViolation(format!(
+                "every Boss has exactly one trademark; Boss '{}' declares {}",
+                cmd.boss_id,
+                cmd.trademarks.len()
+            )));
+        }
+
+        // Legal-HP invariant on the proposed starting HP.
+        if !LEGAL_STARTING_HP.contains(&cmd.starting_hp) {
+            return Err(DomainError::InvariantViolation(format!(
+                "Boss starting HP must fall within [{}, {}]; Boss '{}' has {}",
+                LEGAL_STARTING_HP.start(),
+                LEGAL_STARTING_HP.end(),
+                cmd.boss_id,
+                cmd.starting_hp
+            )));
+        }
+
+        // Authoritative-roster invariant (aggregate configuration).
+        self.ensure_authoritative_roster()?;
+        // Signature-set invariant against the catalog of valid cards.
+        self.ensure_signature_set(&cmd.signature_card_ids)?;
+
+        // All invariants hold: commit the definition to aggregate state and emit.
+        let hero_power = cmd.hero_powers[0].clone();
+        let trademark = cmd.trademarks[0].clone();
+        self.hero_powers = cmd.hero_powers;
+        self.trademarks = cmd.trademarks;
+        self.starting_hp = cmd.starting_hp;
+
+        let event = Event::BossDefined(BossDefined {
+            boss_id: cmd.boss_id,
+            name: cmd.name,
+            starting_hp: cmd.starting_hp,
+            hero_power,
+            trademark,
+            signature_card_ids: cmd.signature_card_ids,
+        });
+        self.root.record(Box::new(event.clone()));
+        Ok(vec![event])
+    }
+
     /// Handle `AssignSignatureCardsCmd`: verify the command targets this Boss,
     /// enforce all four invariants, bind the signature set, and emit
     /// [`Event::SignatureAssigned`].
@@ -327,6 +473,12 @@ impl Aggregate for BossDefinition {
 
     fn execute(&mut self, command: Command) -> Result<Vec<Self::Event>, DomainError> {
         match command.name.as_str() {
+            DEFINE_BOSS => {
+                let cmd: DefineBoss = serde_json::from_slice(&command.payload).map_err(|e| {
+                    DomainError::InvariantViolation(format!("malformed DefineBossCmd payload: {e}"))
+                })?;
+                self.define_boss(cmd)
+            }
             ASSIGN_SIGNATURE_CARDS => {
                 let cmd: AssignSignatureCards =
                     serde_json::from_slice(&command.payload).map_err(|e| {
@@ -367,6 +519,154 @@ mod tests {
         boss
     }
 
+    /// A `DefineBossCmd` that satisfies every invariant, as a starting point
+    /// tests mutate one field at a time to drive a specific rejection. It targets
+    /// the same `boss-01` as [`valid_boss`], whose catalog and roster it relies
+    /// on for the signature-set and authoritative-roster invariants.
+    fn valid_define_cmd() -> DefineBoss {
+        DefineBoss {
+            boss_id: "boss-01".to_string(),
+            name: "The Fixer".to_string(),
+            starting_hp: 60,
+            hero_powers: vec!["Smash and Grab".to_string()],
+            trademarks: vec!["The Vault Door".to_string()],
+            signature_card_ids: vec!["card-001".to_string(), "card-002".to_string()],
+        }
+    }
+
+    // Scenario: Successfully execute DefineBossCmd.
+    #[test]
+    fn defines_boss_and_emits_boss_defined_event() {
+        let mut boss = valid_boss();
+
+        let events = boss
+            .execute(valid_define_cmd().into_command())
+            .expect("valid definition should succeed");
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_type(), "boss.defined");
+        match &events[0] {
+            Event::BossDefined(defined) => {
+                assert_eq!(defined.boss_id, "boss-01");
+                assert_eq!(defined.name, "The Fixer");
+                assert_eq!(defined.starting_hp, 60);
+                assert_eq!(defined.hero_power, "Smash and Grab");
+                assert_eq!(defined.trademark, "The Vault Door");
+                assert_eq!(defined.signature_card_ids, vec!["card-001", "card-002"]);
+            }
+            other => panic!("expected BossDefined, got {other:?}"),
+        }
+        assert_eq!(boss.version(), 1);
+        assert_eq!(boss.uncommitted_events().len(), 1);
+        assert_eq!(boss.uncommitted_events()[0].event_type(), "boss.defined");
+    }
+
+    // Scenario: DefineBossCmd rejected — every Boss has exactly one hero power and
+    // exactly one trademark.
+    #[test]
+    fn define_rejects_when_boss_has_more_than_one_hero_power() {
+        let mut boss = valid_boss();
+        let cmd = DefineBoss {
+            hero_powers: vec!["Smash and Grab".to_string(), "Second Wind".to_string()],
+            ..valid_define_cmd()
+        };
+
+        let err = boss
+            .execute(cmd.into_command())
+            .expect_err("a Boss with two hero powers must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(boss.version(), 0);
+    }
+
+    #[test]
+    fn define_rejects_when_boss_has_no_trademark() {
+        let mut boss = valid_boss();
+        let cmd = DefineBoss {
+            trademarks: Vec::new(),
+            ..valid_define_cmd()
+        };
+
+        let err = boss
+            .execute(cmd.into_command())
+            .expect_err("a Boss without a trademark must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(boss.version(), 0);
+    }
+
+    // Scenario: DefineBossCmd rejected — every Boss must be assigned a non-empty
+    // signature card set drawn from valid CardDefinitions.
+    #[test]
+    fn define_rejects_empty_signature_card_set() {
+        let mut boss = valid_boss();
+        let cmd = DefineBoss {
+            signature_card_ids: Vec::new(),
+            ..valid_define_cmd()
+        };
+
+        let err = boss
+            .execute(cmd.into_command())
+            .expect_err("an empty signature set must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(boss.version(), 0);
+    }
+
+    #[test]
+    fn define_rejects_signature_card_not_in_catalog() {
+        let mut boss = valid_boss();
+        let cmd = DefineBoss {
+            signature_card_ids: vec!["card-001".to_string(), "card-999".to_string()],
+            ..valid_define_cmd()
+        };
+
+        let err = boss
+            .execute(cmd.into_command())
+            .expect_err("a card outside the catalog must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(boss.version(), 0);
+    }
+
+    // Scenario: DefineBossCmd rejected — Boss starting HP must fall within the
+    // legal HP bounds.
+    #[test]
+    fn define_rejects_starting_hp_outside_legal_bounds() {
+        let mut boss = valid_boss();
+        let cmd = DefineBoss {
+            // One past the legal maximum.
+            starting_hp: LEGAL_STARTING_HP.end() + 1,
+            ..valid_define_cmd()
+        };
+
+        let err = boss
+            .execute(cmd.into_command())
+            .expect_err("HP outside the legal bounds must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(boss.version(), 0);
+    }
+
+    // Scenario: DefineBossCmd rejected — the published roster must contain exactly
+    // the authoritative 18 Bosses before a launch is validated.
+    #[test]
+    fn define_rejects_when_published_roster_is_not_authoritative_size() {
+        let mut boss = valid_boss();
+        // One short of the authoritative roster.
+        boss.set_published_roster_size(AUTHORITATIVE_ROSTER_SIZE - 1);
+
+        let err = boss
+            .execute(valid_define_cmd().into_command())
+            .expect_err("an incomplete roster must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(boss.version(), 0);
+    }
+
+    #[test]
+    fn define_command_payload_round_trips() {
+        let cmd = valid_define_cmd();
+        let command = cmd.into_command();
+        assert_eq!(command.name, DefineBoss::COMMAND);
+        let decoded: DefineBoss = serde_json::from_slice(&command.payload).unwrap();
+        assert_eq!(decoded, valid_define_cmd());
+    }
+
     /// A command binding two valid signature cards to `boss-01`.
     fn valid_cmd() -> AssignSignatureCards {
         AssignSignatureCards::new(
@@ -391,6 +691,7 @@ mod tests {
                 assert_eq!(assigned.boss_id, "boss-01");
                 assert_eq!(assigned.signature_card_ids, vec!["card-001", "card-002"]);
             }
+            other => panic!("expected SignatureAssigned, got {other:?}"),
         }
         // The event was recorded on the aggregate root.
         assert_eq!(boss.version(), 1);
