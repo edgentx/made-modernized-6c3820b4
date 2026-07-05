@@ -58,6 +58,14 @@
 //! re-checks the same rules-contract invariants, resets that seat's Heat per the
 //! rules-contract, and on success emits [`Event::CopEventTriggered`]
 //! (`cop.event.triggered`).
+//!
+//! [`ConcedeMatch`] (`ConcedeMatchCmd`) then forfeits the match for the conceding
+//! player. Concede is the one command the rules-contract exempts from the
+//! whose-turn-it-is rule, so it validates against a real, well-formed match and
+//! re-checks the same rules-contract invariants but — unlike every other command
+//! — does *not* require the conceding player to hold the turn. On success the
+//! opposing seat is declared the sole winner and it emits
+//! [`Event::MatchCompleted`] (`match.completed`).
 
 use std::ops::RangeInclusive;
 
@@ -89,6 +97,9 @@ const END_TURN: &str = "EndTurnCmd";
 
 /// The `ResolveCopEventCmd` command name [`GameSession::execute`] recognizes.
 const RESOLVE_COP_EVENT: &str = "ResolveCopEventCmd";
+
+/// The `ConcedeMatchCmd` command name [`GameSession::execute`] recognizes.
+const CONCEDE_MATCH: &str = "ConcedeMatchCmd";
 
 /// Heat a player gains each time they play a card. Playing a card always raises
 /// Heat, so a successful [`PlayCard`] emits an accompanying `heat.raised` event.
@@ -547,6 +558,45 @@ impl ResolveCopEvent {
     }
 }
 
+/// The `ConcedeMatchCmd` payload: the match being played and the player
+/// forfeiting it. Field names are the match-play schema's `camelCase`.
+///
+/// Build one directly and turn it into a [`Command`] with
+/// [`ConcedeMatch::into_command`], or decode it from a command payload via
+/// [`serde_json`] inside [`GameSession::execute`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConcedeMatch {
+    /// Identifier of the match being played; must name the match this session
+    /// records.
+    pub match_id: String,
+    /// Identity of the player forfeiting the match; must name one of this
+    /// session's configured Outfits. Unlike every other command, concede is
+    /// valid whether or not it is this player's turn.
+    pub player_id: String,
+}
+
+impl ConcedeMatch {
+    /// The command name this maps to.
+    pub const COMMAND: &'static str = CONCEDE_MATCH;
+
+    /// Build a `ConcedeMatchCmd` forfeiting `match_id` for `player_id`.
+    pub fn new(match_id: impl Into<String>, player_id: impl Into<String>) -> Self {
+        Self {
+            match_id: match_id.into(),
+            player_id: player_id.into(),
+        }
+    }
+
+    /// Encode this command as a [`shared::Command`] carrying a JSON payload,
+    /// ready to hand to [`GameSession::execute`].
+    pub fn into_command(&self) -> Command {
+        // Serialization of a plain data struct to a Vec cannot fail here.
+        let payload = serde_json::to_vec(self).expect("ConcedeMatch is always serializable");
+        Command::with_payload(Self::COMMAND, payload)
+    }
+}
+
 /// The started match, carried by [`Event::MatchStarted`] and thus by the emitted
 /// `match.started` event.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -720,6 +770,24 @@ pub struct CopEventTriggered {
     pub new_heat: i32,
 }
 
+/// A conceded match, carried by [`Event::MatchCompleted`] and thus by the
+/// emitted `match.completed` event. A concede forfeits for one seat, so the
+/// match ends yielding exactly one winner — the opposing seat.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MatchCompleted {
+    /// The match that was completed by the concession.
+    pub match_id: String,
+    /// The player identity that conceded (forfeited) the match.
+    pub conceding_player_id: String,
+    /// The seat that conceded.
+    pub conceding_player: Player,
+    /// The player identity awarded the win.
+    pub winning_player_id: String,
+    /// The winning seat — the opponent of the conceding seat, so exactly one
+    /// winner is produced.
+    pub winner: Player,
+}
+
 /// Domain events emitted by [`GameSession`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Event {
@@ -745,6 +813,8 @@ pub enum Event {
     /// A Cop Event (fired when Heat hit the upper bound) was resolved from the
     /// seeded d10 table, resetting the seat's Heat.
     CopEventTriggered(CopEventTriggered),
+    /// A player conceded, forfeiting the match to the opposing seat.
+    MatchCompleted(MatchCompleted),
 }
 
 impl DomainEvent for Event {
@@ -760,6 +830,7 @@ impl DomainEvent for Event {
             Event::FatigueDamageDealt(_) => "fatigue.damage.dealt",
             Event::TurnEnded(_) => "turn.ended",
             Event::CopEventTriggered(_) => "cop.event.triggered",
+            Event::MatchCompleted(_) => "match.completed",
         }
     }
 }
@@ -1575,6 +1646,57 @@ impl GameSession {
         self.root.record(Box::new(triggered.clone()));
         Ok(vec![triggered])
     }
+
+    /// Handle `ConcedeMatchCmd`: verify the command targets this match and a real
+    /// player, and enforce every match-play invariant against the session's
+    /// state. Concede is the rules-contract's sole exception to the
+    /// whose-turn-it-is rule, so — unlike every other handler — it does *not*
+    /// reject when the conceding seat does not hold the turn. On success the
+    /// opposing seat is declared the sole winner and it emits
+    /// [`Event::MatchCompleted`].
+    fn concede_match(&mut self, cmd: ConcedeMatch) -> Result<Vec<Event>, DomainError> {
+        // The command must name the match this session actually records.
+        if cmd.match_id != self.match_id {
+            return Err(DomainError::InvariantViolation(format!(
+                "command targets match '{}' but this session records '{}'",
+                cmd.match_id, self.match_id
+            )));
+        }
+        // A player must be named, and it must be one of the configured Outfits.
+        if cmd.player_id.trim().is_empty() {
+            return Err(DomainError::InvariantViolation(
+                "a playerId must be provided".to_string(),
+            ));
+        }
+        let seat = self.seat_for_player(&cmd.player_id)?;
+
+        // Enforce every match-play invariant before applying the concession.
+        self.ensure_boards_within_caps()?;
+        self.ensure_heat_within_bounds()?;
+        self.ensure_starting_juice_valid()?;
+        self.ensure_decks_nonempty()?;
+        self.ensure_heists_prereqs_satisfied()?;
+        self.ensure_bosses_alive()?;
+        // A concede still requires a well-formed, in-progress match (a designated
+        // whose-turn-it-is), but — being the exception to the turn-ownership rule
+        // — it deliberately does *not* require the conceding seat to hold it.
+        self.ensure_opening_player_designated()?;
+
+        // Forfeiting hands the win to the opposing seat, yielding exactly one
+        // winner as the match-end rules-contract requires.
+        let winner = Self::opponent_of(seat);
+        let winning_player_id = self.outfit_at(winner).name.clone();
+
+        let completed = Event::MatchCompleted(MatchCompleted {
+            match_id: cmd.match_id,
+            conceding_player_id: cmd.player_id,
+            conceding_player: seat,
+            winning_player_id,
+            winner,
+        });
+        self.root.record(Box::new(completed.clone()));
+        Ok(vec![completed])
+    }
 }
 
 impl Aggregate for GameSession {
@@ -1635,6 +1757,14 @@ impl Aggregate for GameSession {
                         ))
                     })?;
                 self.resolve_cop_event(cmd)
+            }
+            CONCEDE_MATCH => {
+                let cmd: ConcedeMatch = serde_json::from_slice(&command.payload).map_err(|e| {
+                    DomainError::InvariantViolation(format!(
+                        "malformed ConcedeMatchCmd payload: {e}"
+                    ))
+                })?;
+                self.concede_match(cmd)
             }
             // Any other command is unknown to this aggregate.
             _ => Err(DomainError::unknown_command(
@@ -3419,5 +3549,227 @@ mod tests {
         assert_eq!(command.name, ResolveCopEvent::COMMAND);
         let decoded: ResolveCopEvent = serde_json::from_slice(&command.payload).unwrap();
         assert_eq!(decoded, valid_resolve_cop_event());
+    }
+
+    // ---- ConcedeMatchCmd (S-9) ---------------------------------------------
+
+    /// A legal `ConcedeMatchCmd` for `m-1`: player `A` forfeits the match. Tests
+    /// mutate one aspect at a time to drive a rejection.
+    fn valid_concede() -> ConcedeMatch {
+        ConcedeMatch::new("m-1", "m-1-a")
+    }
+
+    // Scenario: Successfully execute ConcedeMatchCmd.
+    #[test]
+    fn concedes_match_and_emits_match_completed_event() {
+        let mut session = valid_session();
+
+        let events = session
+            .execute(valid_concede().into_command())
+            .expect("a valid concede should succeed");
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_type(), "match.completed");
+        match &events[0] {
+            Event::MatchCompleted(done) => {
+                assert_eq!(done.match_id, "m-1");
+                assert_eq!(done.conceding_player_id, "m-1-a");
+                assert_eq!(done.conceding_player, Player::A);
+                assert_eq!(done.winning_player_id, "m-1-b");
+                assert_eq!(done.winner, Player::B);
+            }
+            other => panic!("expected MatchCompleted, got {other:?}"),
+        }
+        assert_eq!(session.version(), 1);
+        assert_eq!(session.uncommitted_events().len(), 1);
+        assert_eq!(
+            session.uncommitted_events()[0].event_type(),
+            "match.completed"
+        );
+    }
+
+    // Concede is the exception to the whose-turn-it-is rule: the player who does
+    // *not* hold the turn may still forfeit, handing the win to the turn-holder.
+    #[test]
+    fn concede_is_allowed_off_turn() {
+        let mut session = valid_session(); // player A holds the opening turn.
+
+        // Player B concedes on player A's turn — permitted only for concede.
+        let events = session
+            .execute(ConcedeMatch::new("m-1", "m-1-b").into_command())
+            .expect("conceding off-turn should succeed");
+
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            Event::MatchCompleted(done) => {
+                assert_eq!(done.conceding_player, Player::B);
+                assert_eq!(done.winner, Player::A);
+            }
+            other => panic!("expected MatchCompleted, got {other:?}"),
+        }
+    }
+
+    // Scenario: rejected — Juice starts at 1 (hard-capped at 10).
+    #[test]
+    fn concede_rejects_when_starting_juice_is_not_one() {
+        let mut session = valid_session();
+        let mut outfit = OutfitConfig::new("m-1-a");
+        outfit.starting_juice = 3;
+        session.configure_player_a(outfit);
+
+        let err = session
+            .execute(valid_concede().into_command())
+            .expect_err("an illegal opening Juice must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(session.version(), 0);
+    }
+
+    // Scenario: rejected — a board may hold at most 7 Operators and 3 Vehicles.
+    #[test]
+    fn concede_rejects_when_board_exceeds_operator_cap() {
+        let mut session = valid_session();
+        let mut outfit = OutfitConfig::new("m-1-a");
+        outfit.operators = MAX_OPERATORS + 1;
+        session.configure_player_a(outfit);
+
+        let err = session
+            .execute(valid_concede().into_command())
+            .expect_err("an over-capacity board must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(session.version(), 0);
+    }
+
+    #[test]
+    fn concede_rejects_when_board_exceeds_vehicle_cap() {
+        let mut session = valid_session();
+        let mut outfit = OutfitConfig::new("m-1-b");
+        outfit.vehicles = MAX_VEHICLES + 1;
+        session.configure_player_b(outfit);
+
+        let err = session
+            .execute(valid_concede().into_command())
+            .expect_err("an over-capacity vehicle board must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(session.version(), 0);
+    }
+
+    // Scenario: rejected — Heat is bounded 0..10 and no state may leave it.
+    #[test]
+    fn concede_rejects_when_heat_leaves_bounds() {
+        let mut session = valid_session();
+        let mut outfit = OutfitConfig::new("m-1-a");
+        outfit.starting_heat = *HEAT_BOUNDS.end() + 1;
+        session.configure_player_a(outfit);
+
+        let err = session
+            .execute(valid_concede().into_command())
+            .expect_err("Heat outside its bounds must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(session.version(), 0);
+    }
+
+    // Scenario: rejected — a Heist resolves only after its prerequisite queue is
+    // satisfied.
+    #[test]
+    fn concede_rejects_when_heist_resolved_with_outstanding_prereqs() {
+        let mut session = valid_session();
+        let mut outfit = OutfitConfig::new("m-1-a");
+        outfit.heist_resolved = true;
+        outfit.outstanding_heist_prereqs = 2;
+        session.configure_player_a(outfit);
+
+        let err = session
+            .execute(valid_concede().into_command())
+            .expect_err("a Heist resolved with outstanding prereqs must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(session.version(), 0);
+    }
+
+    // Scenario: rejected — drawing from an empty deck deals Fatigue instead of a
+    // card, so a match may not carry a deckless Outfit.
+    #[test]
+    fn concede_rejects_when_deck_is_empty() {
+        let mut session = valid_session();
+        let mut outfit = OutfitConfig::new("m-1-b");
+        outfit.deck_size = 0;
+        session.configure_player_b(outfit);
+
+        let err = session
+            .execute(valid_concede().into_command())
+            .expect_err("an empty deck must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(session.version(), 0);
+    }
+
+    // Scenario: rejected — a match ends the instant a Boss's HP reaches 0 or
+    // below, so a Boss cannot be conceded around while already defeated.
+    #[test]
+    fn concede_rejects_when_a_boss_is_already_defeated() {
+        let mut session = valid_session();
+        let mut outfit = OutfitConfig::new("m-1-a");
+        outfit.boss_hp = 0;
+        session.configure_player_a(outfit);
+
+        let err = session
+            .execute(valid_concede().into_command())
+            .expect_err("a defeated Boss must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(session.version(), 0);
+    }
+
+    // Scenario: rejected — a command needs a well-formed, in-progress match; a
+    // turn-less session has no whose-turn-it-is and is ill-formed even for
+    // concede.
+    #[test]
+    fn concede_rejects_when_no_opening_player_is_designated() {
+        let mut session = valid_session();
+        session.set_opening_player(None);
+
+        let err = session
+            .execute(valid_concede().into_command())
+            .expect_err("a turn-less session must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(session.version(), 0);
+    }
+
+    // A concede must name the match this session records.
+    #[test]
+    fn concede_rejects_when_command_targets_a_different_match() {
+        let mut session = valid_session();
+        let err = session
+            .execute(ConcedeMatch::new("other-match", "m-1-a").into_command())
+            .expect_err("a mismatched match id must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(session.version(), 0);
+    }
+
+    // A concede must name a configured Outfit.
+    #[test]
+    fn concede_rejects_unknown_player() {
+        let mut session = valid_session();
+        let err = session
+            .execute(ConcedeMatch::new("m-1", "nobody").into_command())
+            .expect_err("an unknown player must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(session.version(), 0);
+    }
+
+    #[test]
+    fn concede_rejects_blank_player() {
+        let mut session = valid_session();
+        let err = session
+            .execute(ConcedeMatch::new("m-1", "   ").into_command())
+            .expect_err("a blank playerId must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(session.version(), 0);
+    }
+
+    #[test]
+    fn concede_command_payload_round_trips() {
+        let cmd = valid_concede();
+        let command = cmd.into_command();
+        assert_eq!(command.name, ConcedeMatch::COMMAND);
+        let decoded: ConcedeMatch = serde_json::from_slice(&command.payload).unwrap();
+        assert_eq!(decoded, valid_concede());
     }
 }
