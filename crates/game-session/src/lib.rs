@@ -20,9 +20,15 @@
 //! selection: it validates the redraw request for the turn-holding player,
 //! re-checks the same rules-contract invariants against the session's opening
 //! state, and on success emits [`Event::MulliganCompleted`]
-//! (`mulligan.completed`). The module is
-//! hand-written (it no longer uses `shared::stub_aggregate!`) but preserves the
-//! same public surface — a [`GameSession`] aggregate and a
+//! (`mulligan.completed`).
+//!
+//! [`PlayCard`] (`PlayCardCmd`) then plays a card from the turn-holding player's
+//! hand at a target: it pays the card's Juice cost (rejecting a card the player
+//! cannot afford), re-checks the same rules-contract invariants, and raises the
+//! player's Heat — so on success it emits *two* events, [`Event::CardPlayed`]
+//! (`card.played`) followed by [`Event::HeatRaised`] (`heat.raised`). The module
+//! is hand-written (it no longer uses `shared::stub_aggregate!`) but preserves
+//! the same public surface — a [`GameSession`] aggregate and a
 //! [`GameSessionRepository`] port — so the persistence adapters in
 //! `crates/mocks` and the actix-web server keep compiling unchanged.
 
@@ -41,6 +47,13 @@ const START_MATCH: &str = "StartMatchCmd";
 
 /// The `MulliganCmd` command name [`GameSession::execute`] recognizes.
 const MULLIGAN: &str = "MulliganCmd";
+
+/// The `PlayCardCmd` command name [`GameSession::execute`] recognizes.
+const PLAY_CARD: &str = "PlayCardCmd";
+
+/// Heat a player gains each time they play a card. Playing a card always raises
+/// Heat, so a successful [`PlayCard`] emits an accompanying `heat.raised` event.
+pub const HEAT_PER_PLAY: i32 = 1;
 
 /// A player's board may hold at most this many Operators simultaneously.
 pub const MAX_OPERATORS: usize = 7;
@@ -97,6 +110,11 @@ pub struct OutfitConfig {
     pub starting_heat: i32,
     /// Opening Juice for this Outfit. Must equal [`STARTING_JUICE`].
     pub starting_juice: u8,
+    /// The seat's *currently available* Juice pool — it ramps +1 from
+    /// [`STARTING_JUICE`] each of the owner's turns and is hard-capped at
+    /// [`JUICE_CAP`]. A card may only be played when its Juice cost does not
+    /// exceed this amount (see [`GameSession::ensure_card_affordable`]).
+    pub available_juice: u8,
     /// Whether a Heist has been marked resolved for this Outfit at start.
     pub heist_resolved: bool,
     /// Outstanding prerequisites in this Outfit's Heist prerequisite queue. A
@@ -119,6 +137,9 @@ impl OutfitConfig {
             boss_hp: 30,
             starting_heat: 0,
             starting_juice: STARTING_JUICE,
+            // A few turns in from the opening: enough ramped Juice to afford a
+            // modestly-costed card, still comfortably within the hard cap.
+            available_juice: 3,
             heist_resolved: false,
             outstanding_heist_prereqs: 0,
         }
@@ -225,6 +246,64 @@ impl Mulligan {
     }
 }
 
+/// The `PlayCardCmd` payload: the match being played, the player playing the
+/// card, the specific card instance leaving their hand, the target the card
+/// resolves against, and the card's Juice cost. Field names are the match-play
+/// schema's `camelCase`.
+///
+/// Build one directly and turn it into a [`Command`] with
+/// [`PlayCard::into_command`], or decode it from a command payload via
+/// [`serde_json`] inside [`GameSession::execute`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlayCard {
+    /// Identifier of the match being played; must name the match this session
+    /// records.
+    pub match_id: String,
+    /// Identity of the player playing the card; must name one of this session's
+    /// configured Outfits, and it must be that player's turn.
+    pub player_id: String,
+    /// The specific card instance being played out of the player's hand. Must be
+    /// non-blank.
+    pub card_instance_id: String,
+    /// A reference to the target the card resolves against. Must be non-blank.
+    pub target_ref: String,
+    /// The card's Juice cost. A card may only be played when its cost does not
+    /// exceed the player's currently available Juice.
+    pub juice_cost: u8,
+}
+
+impl PlayCard {
+    /// The command name this maps to.
+    pub const COMMAND: &'static str = PLAY_CARD;
+
+    /// Build a `PlayCardCmd` playing `card_instance_id` at `target_ref` for
+    /// `player_id` in `match_id`, paying `juice_cost` Juice.
+    pub fn new(
+        match_id: impl Into<String>,
+        player_id: impl Into<String>,
+        card_instance_id: impl Into<String>,
+        target_ref: impl Into<String>,
+        juice_cost: u8,
+    ) -> Self {
+        Self {
+            match_id: match_id.into(),
+            player_id: player_id.into(),
+            card_instance_id: card_instance_id.into(),
+            target_ref: target_ref.into(),
+            juice_cost,
+        }
+    }
+
+    /// Encode this command as a [`shared::Command`] carrying a JSON payload,
+    /// ready to hand to [`GameSession::execute`].
+    pub fn into_command(&self) -> Command {
+        // Serialization of a plain data struct to a Vec cannot fail here.
+        let payload = serde_json::to_vec(self).expect("PlayCard is always serializable");
+        Command::with_payload(Self::COMMAND, payload)
+    }
+}
+
 /// The started match, carried by [`Event::MatchStarted`] and thus by the emitted
 /// `match.started` event.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -255,6 +334,38 @@ pub struct MulliganCompleted {
     pub redrawn_card_ids: Vec<String>,
 }
 
+/// A played card, carried by [`Event::CardPlayed`] and thus by the emitted
+/// `card.played` event.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CardPlayed {
+    /// The match the card was played in.
+    pub match_id: String,
+    /// The player identity that played the card.
+    pub player_id: String,
+    /// The seat that player occupies.
+    pub player: Player,
+    /// The card instance that left the player's hand.
+    pub card_instance_id: String,
+    /// The target the card resolved against.
+    pub target_ref: String,
+    /// The Juice paid to play the card.
+    pub juice_spent: u8,
+}
+
+/// A Heat increase, carried by [`Event::HeatRaised`] and thus by the emitted
+/// `heat.raised` event. Playing a card always raises the player's Heat.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeatRaised {
+    /// The match the Heat was raised in.
+    pub match_id: String,
+    /// The seat whose Heat rose.
+    pub player: Player,
+    /// How much Heat was gained.
+    pub amount: i32,
+    /// The player's resulting Heat after the raise (always within [`HEAT_BOUNDS`]).
+    pub new_heat: i32,
+}
+
 /// Domain events emitted by [`GameSession`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Event {
@@ -262,6 +373,10 @@ pub enum Event {
     MatchStarted(MatchStarted),
     /// A player's opening-hand redraw passed every invariant and was applied.
     MulliganCompleted(MulliganCompleted),
+    /// A card passed every invariant, was paid for, and was played.
+    CardPlayed(CardPlayed),
+    /// Playing a card raised the acting player's Heat.
+    HeatRaised(HeatRaised),
 }
 
 impl DomainEvent for Event {
@@ -269,6 +384,8 @@ impl DomainEvent for Event {
         match self {
             Event::MatchStarted(_) => "match.started",
             Event::MulliganCompleted(_) => "mulligan.completed",
+            Event::CardPlayed(_) => "card.played",
+            Event::HeatRaised(_) => "heat.raised",
         }
     }
 }
@@ -634,6 +751,113 @@ impl GameSession {
         self.root.record(Box::new(event.clone()));
         Ok(vec![event])
     }
+
+    /// Juice-affordability invariant: Juice starts at [`STARTING_JUICE`], ramps
+    /// +1 each of the owner's turns, and is hard-capped at [`JUICE_CAP`]; a card
+    /// may only be played when its Juice cost does not exceed the seat's
+    /// currently available Juice.
+    fn ensure_card_affordable(&self, seat: Player, juice_cost: u8) -> Result<(), DomainError> {
+        let available = self.outfit_at(seat).available_juice;
+        if available > JUICE_CAP {
+            return Err(DomainError::InvariantViolation(format!(
+                "player {seat:?} has available Juice {available}, exceeding the hard cap of {JUICE_CAP}"
+            )));
+        }
+        if juice_cost > available {
+            return Err(DomainError::InvariantViolation(format!(
+                "card costs {juice_cost} Juice but player {seat:?} only has {available} available; a card may only be played when its cost does not exceed available Juice"
+            )));
+        }
+        Ok(())
+    }
+
+    /// The Heat the acting seat would hold after playing a card, guaranteeing the
+    /// raise keeps Heat within [`HEAT_BOUNDS`] — no state may leave Heat outside
+    /// `[0, 10]`.
+    fn heat_after_play(&self, seat: Player) -> Result<i32, DomainError> {
+        let new_heat = self.outfit_at(seat).starting_heat + HEAT_PER_PLAY;
+        if !HEAT_BOUNDS.contains(&new_heat) {
+            return Err(DomainError::InvariantViolation(format!(
+                "playing this card would raise player {seat:?} Heat to {new_heat}, leaving the bounds [{}, {}]",
+                HEAT_BOUNDS.start(),
+                HEAT_BOUNDS.end()
+            )));
+        }
+        Ok(new_heat)
+    }
+
+    /// Handle `PlayCardCmd`: verify the command targets this match, a real player
+    /// whose turn it is, and a well-formed card/target; enforce every match-play
+    /// invariant against the session's state; pay the card's Juice cost; and emit
+    /// [`Event::CardPlayed`] followed by [`Event::HeatRaised`].
+    fn play_card(&mut self, cmd: PlayCard) -> Result<Vec<Event>, DomainError> {
+        // The command must name the match this session actually records.
+        if cmd.match_id != self.match_id {
+            return Err(DomainError::InvariantViolation(format!(
+                "command targets match '{}' but this session records '{}'",
+                cmd.match_id, self.match_id
+            )));
+        }
+        // A player must be named, and it must be one of the configured Outfits.
+        if cmd.player_id.trim().is_empty() {
+            return Err(DomainError::InvariantViolation(
+                "a playerId must be provided".to_string(),
+            ));
+        }
+        let seat = self.seat_for_player(&cmd.player_id)?;
+
+        // The card being played and its target must both be identified.
+        if cmd.card_instance_id.trim().is_empty() {
+            return Err(DomainError::InvariantViolation(
+                "a cardInstanceId must be provided".to_string(),
+            ));
+        }
+        if cmd.target_ref.trim().is_empty() {
+            return Err(DomainError::InvariantViolation(
+                "a targetRef must be provided".to_string(),
+            ));
+        }
+
+        // Enforce every match-play invariant before applying the play.
+        self.ensure_boards_within_caps()?;
+        self.ensure_heat_within_bounds()?;
+        self.ensure_starting_juice_valid()?;
+        self.ensure_decks_nonempty()?;
+        self.ensure_heists_prereqs_satisfied()?;
+        self.ensure_bosses_alive()?;
+        let turn_player = self.ensure_opening_player_designated()?;
+
+        // Turn-ownership: a card is played only by the player whose turn it is.
+        if seat != turn_player {
+            return Err(DomainError::InvariantViolation(format!(
+                "player '{}' (seat {seat:?}) may not play a card; it is player {turn_player:?}'s turn",
+                cmd.player_id
+            )));
+        }
+
+        // Pay the card's Juice cost, and compute the Heat the play raises.
+        self.ensure_card_affordable(seat, cmd.juice_cost)?;
+        let new_heat = self.heat_after_play(seat)?;
+
+        // A successful play emits the card first, then the Heat it raised.
+        let played = Event::CardPlayed(CardPlayed {
+            match_id: cmd.match_id.clone(),
+            player_id: cmd.player_id,
+            player: seat,
+            card_instance_id: cmd.card_instance_id,
+            target_ref: cmd.target_ref,
+            juice_spent: cmd.juice_cost,
+        });
+        let raised = Event::HeatRaised(HeatRaised {
+            match_id: cmd.match_id,
+            player: seat,
+            amount: HEAT_PER_PLAY,
+            new_heat,
+        });
+        self.root.record(Box::new(played.clone()));
+        self.root.record(Box::new(raised.clone()));
+        Ok(vec![played, raised])
+    }
 }
 
 impl Aggregate for GameSession {
@@ -656,6 +880,12 @@ impl Aggregate for GameSession {
                     DomainError::InvariantViolation(format!("malformed MulliganCmd payload: {e}"))
                 })?;
                 self.mulligan(cmd)
+            }
+            PLAY_CARD => {
+                let cmd: PlayCard = serde_json::from_slice(&command.payload).map_err(|e| {
+                    DomainError::InvariantViolation(format!("malformed PlayCardCmd payload: {e}"))
+                })?;
+                self.play_card(cmd)
             }
             // Any other command is unknown to this aggregate.
             _ => Err(DomainError::unknown_command(
@@ -1148,5 +1378,259 @@ mod tests {
         assert_eq!(command.name, Mulligan::COMMAND);
         let decoded: Mulligan = serde_json::from_slice(&command.payload).unwrap();
         assert_eq!(decoded, valid_mulligan());
+    }
+
+    // ---- PlayCardCmd (S-4) --------------------------------------------------
+
+    /// A legal `PlayCardCmd` for `m-1`: the turn-holding player `A` plays a
+    /// card instance at a target, paying 2 Juice (within the default available
+    /// pool of 3). Tests mutate one aspect at a time to drive a rejection.
+    fn valid_play_card() -> PlayCard {
+        PlayCard::new("m-1", "m-1-a", "card-instance-1", "target-1", 2)
+    }
+
+    // Scenario: Successfully execute PlayCardCmd — a card.played event and a
+    // heat.raised event are emitted.
+    #[test]
+    fn plays_card_and_emits_card_played_and_heat_raised_events() {
+        let mut session = valid_session();
+
+        let events = session
+            .execute(valid_play_card().into_command())
+            .expect("a valid play should succeed");
+
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].event_type(), "card.played");
+        assert_eq!(events[1].event_type(), "heat.raised");
+        match &events[0] {
+            Event::CardPlayed(played) => {
+                assert_eq!(played.match_id, "m-1");
+                assert_eq!(played.player_id, "m-1-a");
+                assert_eq!(played.player, Player::A);
+                assert_eq!(played.card_instance_id, "card-instance-1");
+                assert_eq!(played.target_ref, "target-1");
+                assert_eq!(played.juice_spent, 2);
+            }
+            other => panic!("expected CardPlayed, got {other:?}"),
+        }
+        match &events[1] {
+            Event::HeatRaised(raised) => {
+                assert_eq!(raised.match_id, "m-1");
+                assert_eq!(raised.player, Player::A);
+                assert_eq!(raised.amount, HEAT_PER_PLAY);
+                // Default opening Heat is 0, raised by HEAT_PER_PLAY.
+                assert_eq!(raised.new_heat, HEAT_PER_PLAY);
+            }
+            other => panic!("expected HeatRaised, got {other:?}"),
+        }
+        // Two events recorded on the root: the version advances by two.
+        assert_eq!(session.version(), 2);
+        assert_eq!(session.uncommitted_events().len(), 2);
+        assert_eq!(session.uncommitted_events()[0].event_type(), "card.played");
+        assert_eq!(session.uncommitted_events()[1].event_type(), "heat.raised");
+    }
+
+    // Scenario: rejected — a card may only be played when its Juice cost does not
+    // exceed currently available Juice.
+    #[test]
+    fn play_card_rejects_when_cost_exceeds_available_juice() {
+        let mut session = valid_session();
+        // Default available Juice is 3; a cost of 4 cannot be afforded.
+        let err = session
+            .execute(PlayCard::new("m-1", "m-1-a", "card-instance-1", "target-1", 4).into_command())
+            .expect_err("a card the player cannot afford must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(session.version(), 0);
+    }
+
+    // Scenario: rejected — a board may hold at most 7 Operators and 3 Vehicles.
+    #[test]
+    fn play_card_rejects_when_board_exceeds_operator_cap() {
+        let mut session = valid_session();
+        let mut outfit = OutfitConfig::new("m-1-a");
+        outfit.operators = MAX_OPERATORS + 1;
+        session.configure_player_a(outfit);
+
+        let err = session
+            .execute(valid_play_card().into_command())
+            .expect_err("an over-capacity board must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(session.version(), 0);
+    }
+
+    #[test]
+    fn play_card_rejects_when_board_exceeds_vehicle_cap() {
+        let mut session = valid_session();
+        let mut outfit = OutfitConfig::new("m-1-b");
+        outfit.vehicles = MAX_VEHICLES + 1;
+        session.configure_player_b(outfit);
+
+        let err = session
+            .execute(valid_play_card().into_command())
+            .expect_err("an over-capacity vehicle board must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(session.version(), 0);
+    }
+
+    // Scenario: rejected — Heat is bounded 0..10 and no state may leave it.
+    #[test]
+    fn play_card_rejects_when_heat_leaves_bounds() {
+        let mut session = valid_session();
+        let mut outfit = OutfitConfig::new("m-1-a");
+        outfit.starting_heat = *HEAT_BOUNDS.end() + 1; // Outside [0, 10].
+        session.configure_player_a(outfit);
+
+        let err = session
+            .execute(valid_play_card().into_command())
+            .expect_err("Heat outside its bounds must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(session.version(), 0);
+    }
+
+    // Scenario: rejected — a Heist resolves only after its prerequisite queue is
+    // satisfied.
+    #[test]
+    fn play_card_rejects_when_heist_resolved_with_outstanding_prereqs() {
+        let mut session = valid_session();
+        let mut outfit = OutfitConfig::new("m-1-a");
+        outfit.heist_resolved = true;
+        outfit.outstanding_heist_prereqs = 2;
+        session.configure_player_a(outfit);
+
+        let err = session
+            .execute(valid_play_card().into_command())
+            .expect_err("a Heist resolved with outstanding prereqs must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(session.version(), 0);
+    }
+
+    // Scenario: rejected — drawing from an empty deck deals Fatigue instead of a
+    // card, so a match may not carry a deckless Outfit.
+    #[test]
+    fn play_card_rejects_when_deck_is_empty() {
+        let mut session = valid_session();
+        let mut outfit = OutfitConfig::new("m-1-b");
+        outfit.deck_size = 0;
+        session.configure_player_b(outfit);
+
+        let err = session
+            .execute(valid_play_card().into_command())
+            .expect_err("an empty deck must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(session.version(), 0);
+    }
+
+    // Scenario: rejected — a command is valid only for the player whose turn it
+    // currently is; a play by the off-turn player is rejected.
+    #[test]
+    fn play_card_rejects_when_not_the_players_turn() {
+        let mut session = valid_session();
+        // Player A holds the turn; player B tries to play a card.
+        let err = session
+            .execute(PlayCard::new("m-1", "m-1-b", "card-instance-1", "target-1", 2).into_command())
+            .expect_err("an off-turn play must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(session.version(), 0);
+    }
+
+    // A turn-less setup is likewise ill-formed for a play.
+    #[test]
+    fn play_card_rejects_when_no_opening_player_is_designated() {
+        let mut session = valid_session();
+        session.set_opening_player(None);
+
+        let err = session
+            .execute(valid_play_card().into_command())
+            .expect_err("a turn-less setup must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(session.version(), 0);
+    }
+
+    // Scenario: rejected — a match ends the instant a Boss's HP reaches 0 or
+    // below, so a defeated Boss cannot be carried into a play.
+    #[test]
+    fn play_card_rejects_when_a_boss_is_defeated() {
+        let mut session = valid_session();
+        let mut outfit = OutfitConfig::new("m-1-a");
+        outfit.boss_hp = 0;
+        session.configure_player_a(outfit);
+
+        let err = session
+            .execute(valid_play_card().into_command())
+            .expect_err("a defeated Boss must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(session.version(), 0);
+    }
+
+    // Scenario: rejected — Juice starts at 1; an opening Juice that is not the
+    // starting value is an illegal Juice state.
+    #[test]
+    fn play_card_rejects_when_starting_juice_is_not_one() {
+        let mut session = valid_session();
+        let mut outfit = OutfitConfig::new("m-1-a");
+        outfit.starting_juice = 3;
+        session.configure_player_a(outfit);
+
+        let err = session
+            .execute(valid_play_card().into_command())
+            .expect_err("an illegal opening Juice must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(session.version(), 0);
+    }
+
+    // A play must name the match this session records.
+    #[test]
+    fn play_card_rejects_when_command_targets_a_different_match() {
+        let mut session = valid_session();
+        let err = session
+            .execute(
+                PlayCard::new("other-match", "m-1-a", "card-instance-1", "target-1", 2)
+                    .into_command(),
+            )
+            .expect_err("a mismatched match id must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(session.version(), 0);
+    }
+
+    // A play must name a configured Outfit.
+    #[test]
+    fn play_card_rejects_unknown_player() {
+        let mut session = valid_session();
+        let err = session
+            .execute(PlayCard::new("m-1", "ghost", "card-instance-1", "target-1", 2).into_command())
+            .expect_err("an unknown player must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(session.version(), 0);
+    }
+
+    // A play must identify the card instance being played.
+    #[test]
+    fn play_card_rejects_blank_card_instance() {
+        let mut session = valid_session();
+        let err = session
+            .execute(PlayCard::new("m-1", "m-1-a", "  ", "target-1", 2).into_command())
+            .expect_err("a blank cardInstanceId must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(session.version(), 0);
+    }
+
+    // A play must identify the target it resolves against.
+    #[test]
+    fn play_card_rejects_blank_target_ref() {
+        let mut session = valid_session();
+        let err = session
+            .execute(PlayCard::new("m-1", "m-1-a", "card-instance-1", "", 2).into_command())
+            .expect_err("a blank targetRef must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(session.version(), 0);
+    }
+
+    #[test]
+    fn play_card_command_payload_round_trips() {
+        let cmd = valid_play_card();
+        let command = cmd.into_command();
+        assert_eq!(command.name, PlayCard::COMMAND);
+        let decoded: PlayCard = serde_json::from_slice(&command.payload).unwrap();
+        assert_eq!(decoded, valid_play_card());
     }
 }
