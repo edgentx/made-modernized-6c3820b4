@@ -14,10 +14,14 @@
 //!    with the ticket's own player.
 //! 4. **Terminal state** — a cancelled or matched ticket cannot be re-matched.
 //!
-//! The only command implemented so far is [`FallbackToExhibition`]
-//! (`FallbackToExhibitionCmd`): it routes an unmatched, still-queued ticket to
-//! an exhibition game once the cap has elapsed, enforcing every invariant, and
-//! on success emits [`Event::FellBackToExhibition`] (`ticket.fell.back.to.exhibition`).
+//! Two commands are implemented. [`FallbackToExhibition`]
+//! (`FallbackToExhibitionCmd`) routes an unmatched, still-queued ticket to an
+//! exhibition game once the cap has elapsed, enforcing every invariant, and on
+//! success emits [`Event::FellBackToExhibition`] (`ticket.fell.back.to.exhibition`).
+//! [`ExpandSearchBand`] (`ExpandSearchBandCmd`) widens the ticket's Rating and
+//! Level search bands as it ages — while it is still queued and before the
+//! fallback cap — and on success emits [`Event::SearchBandExpanded`]
+//! (`search.band.expanded`).
 //! This module is hand-written (it no longer uses `shared::stub_aggregate!`) but
 //! preserves the same public surface — a [`MatchmakingTicket`] aggregate and a
 //! [`MatchmakingTicketRepository`] port — so the persistence adapters in
@@ -31,8 +35,21 @@ use shared::{Aggregate, AggregateRoot, Command, DomainError, DomainEvent, Reposi
 /// used for command routing.
 const AGGREGATE_TYPE: &str = "MatchmakingTicket";
 
-/// The command name [`MatchmakingTicket::execute`] recognizes.
+/// The command name [`MatchmakingTicket::execute`] recognizes for falling back.
 const FALLBACK_TO_EXHIBITION: &str = "FallbackToExhibitionCmd";
+
+/// The command name [`MatchmakingTicket::execute`] recognizes for widening bands.
+const EXPAND_SEARCH_BAND: &str = "ExpandSearchBandCmd";
+
+/// How often the search bands widen while a ticket ages: every 30 seconds of
+/// unmatched queueing adds one widening step to both bands.
+pub const BAND_WIDEN_INTERVAL_SECONDS: u64 = 30;
+
+/// Rating widening granted per elapsed [`BAND_WIDEN_INTERVAL_SECONDS`] step.
+pub const RATING_BAND_WIDEN_STEP: u32 = 50;
+
+/// Level widening granted per elapsed [`BAND_WIDEN_INTERVAL_SECONDS`] step.
+pub const LEVEL_BAND_WIDEN_STEP: u32 = 2;
 
 /// Primary Rating search band: matchmaking initially targets opponents within
 /// ±150 Rating. As the ticket ages the band may only widen, never shrink below
@@ -113,17 +130,89 @@ pub struct FellBackToExhibition {
     pub exhibition_opponent: String,
 }
 
+/// The `ExpandSearchBandCmd` payload: the ticket whose search bands should
+/// widen, and how long it has queued unmatched. Field names are the queue's
+/// `camelCase` schema.
+///
+/// Build one directly and turn it into a [`Command`] with
+/// [`ExpandSearchBand::into_command`], or decode it from a command payload via
+/// [`serde_json`] inside [`MatchmakingTicket::execute`]. The widened bands are a
+/// deterministic function of `elapsed_seconds` (see [`widened_bands`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExpandSearchBand {
+    /// Identity of the ticket whose bands should widen; must name the ticket
+    /// this aggregate records.
+    pub ticket_id: String,
+    /// Seconds the ticket has spent unmatched in the queue. Bands widen one step
+    /// per [`BAND_WIDEN_INTERVAL_SECONDS`]; expansion is only legal while this is
+    /// below [`FALLBACK_CAP_SECONDS`] (past the cap the ticket falls back).
+    pub elapsed_seconds: u64,
+}
+
+impl ExpandSearchBand {
+    /// The command name this maps to.
+    pub const COMMAND: &'static str = EXPAND_SEARCH_BAND;
+
+    /// Build a command widening `ticket_id`'s bands after `elapsed_seconds` of
+    /// unmatched queueing.
+    pub fn new(ticket_id: impl Into<String>, elapsed_seconds: u64) -> Self {
+        Self {
+            ticket_id: ticket_id.into(),
+            elapsed_seconds,
+        }
+    }
+
+    /// Encode this command as a [`shared::Command`] carrying a JSON payload,
+    /// ready to hand to [`MatchmakingTicket::execute`].
+    pub fn into_command(&self) -> Command {
+        // Serialization of a plain data struct to a Vec cannot fail here.
+        let payload = serde_json::to_vec(self).expect("ExpandSearchBand is always serializable");
+        Command::with_payload(Self::COMMAND, payload)
+    }
+}
+
+/// The widened search bands after `elapsed_seconds` of unmatched queueing.
+///
+/// Bands start at the primary widths ([`PRIMARY_RATING_BAND`],
+/// [`PRIMARY_LEVEL_BAND`]) and gain one widening step
+/// ([`RATING_BAND_WIDEN_STEP`] / [`LEVEL_BAND_WIDEN_STEP`]) per elapsed
+/// [`BAND_WIDEN_INTERVAL_SECONDS`]. The result is monotonically non-decreasing in
+/// `elapsed_seconds`, so bands can only ever widen as a ticket ages.
+pub fn widened_bands(elapsed_seconds: u64) -> (u32, u32) {
+    let steps = (elapsed_seconds / BAND_WIDEN_INTERVAL_SECONDS) as u32;
+    (
+        PRIMARY_RATING_BAND + steps * RATING_BAND_WIDEN_STEP,
+        PRIMARY_LEVEL_BAND + steps * LEVEL_BAND_WIDEN_STEP,
+    )
+}
+
+/// The widened search bands, carried by [`Event::SearchBandExpanded`] and thus by
+/// the emitted `search.band.expanded` event.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SearchBandExpanded {
+    /// The ticket whose bands widened.
+    pub ticket_id: String,
+    /// The new Rating search band (at least [`PRIMARY_RATING_BAND`]).
+    pub rating_band: u32,
+    /// The new Level search band (at least [`PRIMARY_LEVEL_BAND`]).
+    pub level_band: u32,
+}
+
 /// Domain events emitted by [`MatchmakingTicket`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Event {
     /// An unmatched ticket exceeded the cap and was routed to an exhibition game.
     FellBackToExhibition(FellBackToExhibition),
+    /// A still-queued ticket widened its Rating and Level search bands as it aged.
+    SearchBandExpanded(SearchBandExpanded),
 }
 
 impl DomainEvent for Event {
     fn event_type(&self) -> &'static str {
         match self {
             Event::FellBackToExhibition(_) => "ticket.fell.back.to.exhibition",
+            Event::SearchBandExpanded(_) => "search.band.expanded",
         }
     }
 }
@@ -292,6 +381,43 @@ impl MatchmakingTicket {
         Ok(())
     }
 
+    /// Fallback-cap invariant, expansion side: a ticket may only widen its bands
+    /// while still within the 5-minute cap. Once [`FALLBACK_CAP_SECONDS`] has
+    /// elapsed the ticket must fall back to exhibition rather than keep expanding.
+    fn ensure_within_fallback_cap(&self, elapsed_seconds: u64) -> Result<(), DomainError> {
+        if elapsed_seconds >= FALLBACK_CAP_SECONDS {
+            return Err(DomainError::InvariantViolation(format!(
+                "ticket '{}' has queued {elapsed_seconds}s, reaching the {}s (5 minute) cap; it \
+                 must fall back to exhibition rather than expand its search bands",
+                self.id, FALLBACK_CAP_SECONDS
+            )));
+        }
+        Ok(())
+    }
+
+    /// Search-band invariant, expansion side: the widened bands must be at least
+    /// the primary widths and may never shrink below the ticket's current bands —
+    /// bands expand monotonically as the ticket ages.
+    fn ensure_bands_widen(&self, rating_band: u32, level_band: u32) -> Result<(), DomainError> {
+        if rating_band < PRIMARY_RATING_BAND || level_band < PRIMARY_LEVEL_BAND {
+            return Err(DomainError::InvariantViolation(format!(
+                "ticket '{}' widened bands (±{rating_band} Rating, ±{level_band} Level) are \
+                 narrower than the primary ±{PRIMARY_RATING_BAND} Rating / ±{PRIMARY_LEVEL_BAND} \
+                 Level band",
+                self.id
+            )));
+        }
+        if rating_band < self.rating_band || level_band < self.level_band {
+            return Err(DomainError::InvariantViolation(format!(
+                "ticket '{}' bands would shrink from (±{} Rating, ±{} Level) to (±{rating_band} \
+                 Rating, ±{level_band} Level); search bands expand monotonically as the ticket \
+                 ages and may never shrink",
+                self.id, self.rating_band, self.level_band
+            )));
+        }
+        Ok(())
+    }
+
     /// Handle `FallbackToExhibitionCmd`: verify the command targets this ticket,
     /// enforce every invariant (re-matchable, cap elapsed, monotonic bands, and a
     /// single valid opponent), and emit [`Event::FellBackToExhibition`].
@@ -321,6 +447,40 @@ impl MatchmakingTicket {
         self.root.record(Box::new(event.clone()));
         Ok(vec![event])
     }
+
+    /// Handle `ExpandSearchBandCmd`: verify the command targets this ticket,
+    /// enforce every applicable invariant (re-matchable, still within the
+    /// fallback cap, and monotonically-widening bands), widen the bands, and emit
+    /// [`Event::SearchBandExpanded`].
+    fn expand_search_band(&mut self, cmd: ExpandSearchBand) -> Result<Vec<Event>, DomainError> {
+        // The command must name the ticket this aggregate actually records.
+        if cmd.ticket_id != self.id {
+            return Err(DomainError::InvariantViolation(format!(
+                "command targets ticket '{}' but this aggregate records '{}'",
+                cmd.ticket_id, self.id
+            )));
+        }
+
+        // A cancelled or matched ticket is terminal and cannot be re-matched, so
+        // it can never widen its bands; expansion is also only legal before the
+        // fallback cap.
+        self.ensure_rematchable()?;
+        self.ensure_within_fallback_cap(cmd.elapsed_seconds)?;
+
+        // Compute the widened bands and reject anything that would shrink them.
+        let (rating_band, level_band) = widened_bands(cmd.elapsed_seconds);
+        self.ensure_bands_widen(rating_band, level_band)?;
+
+        let event = Event::SearchBandExpanded(SearchBandExpanded {
+            ticket_id: cmd.ticket_id,
+            rating_band,
+            level_band,
+        });
+        self.rating_band = rating_band;
+        self.level_band = level_band;
+        self.root.record(Box::new(event.clone()));
+        Ok(vec![event])
+    }
 }
 
 impl Aggregate for MatchmakingTicket {
@@ -340,6 +500,15 @@ impl Aggregate for MatchmakingTicket {
                         ))
                     })?;
                 self.fallback_to_exhibition(cmd)
+            }
+            EXPAND_SEARCH_BAND => {
+                let cmd: ExpandSearchBand =
+                    serde_json::from_slice(&command.payload).map_err(|e| {
+                        DomainError::InvariantViolation(format!(
+                            "malformed ExpandSearchBandCmd payload: {e}"
+                        ))
+                    })?;
+                self.expand_search_band(cmd)
             }
             // Any other command is unknown to this aggregate.
             _ => Err(DomainError::unknown_command(
@@ -391,6 +560,7 @@ mod tests {
                 assert_eq!(paired.ticket_id, "t-01");
                 assert_eq!(paired.exhibition_opponent, "p-rival");
             }
+            other => panic!("expected FellBackToExhibition, got {other:?}"),
         }
         // The ticket transitioned out of the queue and recorded the event.
         assert_eq!(ticket.status(), TicketStatus::FellBackToExhibition);
@@ -523,5 +693,122 @@ mod tests {
         assert_eq!(command.name, FallbackToExhibition::COMMAND);
         let decoded: FallbackToExhibition = serde_json::from_slice(&command.payload).unwrap();
         assert_eq!(decoded, valid_cmd());
+    }
+
+    // --- ExpandSearchBandCmd -------------------------------------------------
+
+    /// A freshly-queued ticket `t-01` for player `p-self`, sitting at the primary
+    /// search bands — the starting point from which expansion widens the bands.
+    fn queued_ticket() -> MatchmakingTicket {
+        let mut ticket = MatchmakingTicket::new("t-01");
+        ticket.set_player("p-self");
+        ticket.set_status(TicketStatus::Queued);
+        ticket.set_search_bands(PRIMARY_RATING_BAND, PRIMARY_LEVEL_BAND);
+        ticket
+    }
+
+    // Scenario: Successfully execute ExpandSearchBandCmd.
+    #[test]
+    fn expands_bands_and_emits_search_band_expanded_event() {
+        let mut ticket = queued_ticket();
+        // Two full 30s intervals have elapsed → two widening steps on each band.
+        let elapsed = BAND_WIDEN_INTERVAL_SECONDS * 2;
+        let expected = widened_bands(elapsed);
+        assert!(expected.0 > PRIMARY_RATING_BAND && expected.1 > PRIMARY_LEVEL_BAND);
+
+        let events = ticket
+            .execute(ExpandSearchBand::new("t-01", elapsed).into_command())
+            .expect("valid expansion should succeed");
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_type(), "search.band.expanded");
+        match &events[0] {
+            Event::SearchBandExpanded(widened) => {
+                assert_eq!(widened.ticket_id, "t-01");
+                assert_eq!(widened.rating_band, expected.0);
+                assert_eq!(widened.level_band, expected.1);
+            }
+            other => panic!("expected SearchBandExpanded, got {other:?}"),
+        }
+        assert_eq!(ticket.version(), 1);
+        assert_eq!(ticket.uncommitted_events().len(), 1);
+    }
+
+    // Scenario: rejected — primary targeting is ±150 Rating; secondary is ±5
+    // Level; bands expand monotonically as the ticket ages.
+    #[test]
+    fn expansion_rejects_when_bands_would_shrink() {
+        let mut ticket = queued_ticket();
+        // The ticket has already widened well past what a fresh (0s) expansion
+        // would produce, so re-expanding with no elapsed time would shrink them.
+        ticket.set_search_bands(PRIMARY_RATING_BAND + 500, PRIMARY_LEVEL_BAND + 20);
+
+        let err = ticket
+            .execute(ExpandSearchBand::new("t-01", 0).into_command())
+            .expect_err("an expansion that would shrink the bands must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(ticket.version(), 0);
+    }
+
+    // Scenario: rejected — a ticket must fall back to exhibition after 5 minutes
+    // of unmatched queueing (past the cap it may not keep expanding).
+    #[test]
+    fn expansion_rejects_once_fallback_cap_reached() {
+        let mut ticket = queued_ticket();
+
+        let err = ticket
+            .execute(ExpandSearchBand::new("t-01", FALLBACK_CAP_SECONDS).into_command())
+            .expect_err("expanding at or past the fallback cap must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(ticket.version(), 0);
+    }
+
+    // Scenario: rejected — a ticket may be paired with exactly one opponent and
+    // never with the ticket's own player: a matched ticket already holds its one
+    // opponent and can no longer be re-matched or re-banded.
+    #[test]
+    fn expansion_rejects_when_ticket_is_already_matched() {
+        let mut ticket = queued_ticket();
+        ticket.set_status(TicketStatus::Matched);
+
+        let err = ticket
+            .execute(ExpandSearchBand::new("t-01", BAND_WIDEN_INTERVAL_SECONDS).into_command())
+            .expect_err("expanding a matched ticket must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(ticket.version(), 0);
+    }
+
+    // Scenario: rejected — a cancelled or matched ticket cannot be re-matched.
+    #[test]
+    fn expansion_rejects_when_ticket_is_cancelled() {
+        let mut ticket = queued_ticket();
+        ticket.set_status(TicketStatus::Cancelled);
+
+        let err = ticket
+            .execute(ExpandSearchBand::new("t-01", BAND_WIDEN_INTERVAL_SECONDS).into_command())
+            .expect_err("expanding a cancelled ticket must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(ticket.version(), 0);
+    }
+
+    // A command naming a different ticket is rejected before any invariant runs.
+    #[test]
+    fn expansion_rejects_command_for_a_different_ticket() {
+        let mut ticket = queued_ticket();
+
+        let err = ticket
+            .execute(ExpandSearchBand::new("t-99", BAND_WIDEN_INTERVAL_SECONDS).into_command())
+            .expect_err("an expansion command for another ticket must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(ticket.version(), 0);
+    }
+
+    #[test]
+    fn expand_command_payload_round_trips() {
+        let cmd = ExpandSearchBand::new("t-01", 90);
+        let command = cmd.into_command();
+        assert_eq!(command.name, ExpandSearchBand::COMMAND);
+        let decoded: ExpandSearchBand = serde_json::from_slice(&command.payload).unwrap();
+        assert_eq!(decoded, ExpandSearchBand::new("t-01", 90));
     }
 }
