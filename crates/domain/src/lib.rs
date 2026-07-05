@@ -12,6 +12,7 @@ pub mod boss_definition;
 pub mod card_definition;
 pub mod card_pack;
 pub mod card_token;
+pub mod emission_pool;
 pub mod expansion_set;
 pub mod marketplace_listing;
 pub mod match_replay;
