@@ -20,14 +20,17 @@
 //!    with it; a claim against an expired (or mismatched) season may not be
 //!    honored.
 //!
-//! Two commands are implemented. [`PurchaseBattlePass`]
+//! Three commands are implemented. [`PurchaseBattlePass`]
 //! (`PurchaseBattlePassCmd`) buys the premium track for a player via a fiat
 //! Order — given a playerId, seasonId, and orderId it enforces every invariant
 //! and on success emits [`Event::BattlePassPurchased`]
 //! (`battlepass.purchased`). [`ClaimPassReward`] (`ClaimPassRewardCmd`) claims
 //! an unlocked reward node in order for a player — given a playerId, seasonId,
 //! and tier it enforces every invariant and on success emits
-//! [`Event::PassRewardClaimed`] (`pass.reward.claimed`). This module is
+//! [`Event::PassRewardClaimed`] (`pass.reward.claimed`). [`ProgressPass`]
+//! (`ProgressPassCmd`) adds pass XP and advances tiers for a player — given a
+//! playerId, seasonId, and xpDelta it enforces every invariant and on success
+//! emits [`Event::PassProgressed`] (`pass.progressed`). This module is
 //! hand-written (it does not use `shared::stub_aggregate!`) but preserves the
 //! same public surface — a [`BattlePass`] aggregate and a
 //! [`BattlePassRepository`] port — so any persistence adapters compile against it
@@ -46,6 +49,9 @@ const CLAIM_PASS_REWARD: &str = "ClaimPassRewardCmd";
 
 /// The command name that purchases the premium BattlePass track.
 const PURCHASE_BATTLE_PASS: &str = "PurchaseBattlePassCmd";
+
+/// The command name that adds pass XP and advances tiers.
+const PROGRESS_PASS: &str = "ProgressPassCmd";
 
 /// The `ClaimPassRewardCmd` payload: which player is claiming, the season the
 /// pass is bound to, and the tier whose reward node is claimed. Field names use
@@ -142,6 +148,50 @@ impl PurchaseBattlePass {
     }
 }
 
+/// The `ProgressPassCmd` payload: which player is progressing, the season the
+/// pass is bound to, and the amount of XP to add. Field names use the shop
+/// service's `camelCase` schema.
+///
+/// Build one directly and turn it into a [`Command`] with
+/// [`ProgressPass::into_command`], or decode it from a command payload via
+/// [`serde_json`] inside [`BattlePass::execute`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProgressPass {
+    /// The player whose pass is progressing; must be non-empty.
+    pub player_id: String,
+    /// The season the pass is bound to; must be non-empty and must name this
+    /// pass's season.
+    pub season_id: String,
+    /// The amount of pass XP to add; must be a valid (non-zero) delta.
+    pub xp_delta: u64,
+}
+
+/// Story-facing alias for the `ProgressPassCmd` payload type.
+pub type ProgressPassCmd = ProgressPass;
+
+impl ProgressPass {
+    /// The command name this maps to.
+    pub const COMMAND: &'static str = PROGRESS_PASS;
+
+    /// Build a command adding `xp_delta` pass XP for `player_id` on `season_id`.
+    pub fn new(player_id: impl Into<String>, season_id: impl Into<String>, xp_delta: u64) -> Self {
+        Self {
+            player_id: player_id.into(),
+            season_id: season_id.into(),
+            xp_delta,
+        }
+    }
+
+    /// Encode this command as a [`shared::Command`] carrying a JSON payload,
+    /// ready to hand to [`BattlePass::execute`].
+    pub fn into_command(&self) -> Command {
+        // Serialization of a plain data struct to a Vec cannot fail here.
+        let payload = serde_json::to_vec(self).expect("ProgressPass is always serializable");
+        Command::with_payload(Self::COMMAND, payload)
+    }
+}
+
 /// The premium-track purchase, carried by [`Event::BattlePassPurchased`] and
 /// thus by the emitted `battlepass.purchased` event.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -166,6 +216,22 @@ pub struct PassRewardClaimed {
     pub tier: u32,
 }
 
+/// The pass XP that was added and the tier the pass advanced to, carried by
+/// [`Event::PassProgressed`] and thus by the emitted `pass.progressed` event.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PassProgressed {
+    /// The player whose pass progressed.
+    pub player_id: String,
+    /// The season the pass is bound to.
+    pub season_id: String,
+    /// The amount of pass XP that was added.
+    pub xp_delta: u64,
+    /// The player's total pass XP after adding `xp_delta`.
+    pub total_xp: u64,
+    /// The tier the pass advanced to after adding `xp_delta`.
+    pub tier: u32,
+}
+
 /// Domain events emitted by [`BattlePass`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Event {
@@ -173,6 +239,8 @@ pub enum Event {
     BattlePassPurchased(BattlePassPurchased),
     /// A reward node was claimed at a tier for a player.
     PassRewardClaimed(PassRewardClaimed),
+    /// Pass XP was added and the pass advanced to a (possibly new) tier.
+    PassProgressed(PassProgressed),
 }
 
 impl DomainEvent for Event {
@@ -180,6 +248,7 @@ impl DomainEvent for Event {
         match self {
             Event::BattlePassPurchased(_) => "battlepass.purchased",
             Event::PassRewardClaimed(_) => "pass.reward.claimed",
+            Event::PassProgressed(_) => "pass.progressed",
         }
     }
 }
@@ -236,6 +305,15 @@ pub struct BattlePass {
     /// The first tier that belongs to the premium track. Claims at or above this
     /// tier require [`Self::premium_purchased`].
     premium_track_start: u32,
+    /// The player's accumulated pass XP. `ProgressPassCmd` adds to this total and
+    /// advances the tier accordingly.
+    total_xp: u64,
+    /// The tier the pass has advanced to given [`Self::total_xp`]. Advancing is
+    /// derived from the XP ladder, whose thresholds are monotonically increasing.
+    current_tier: u32,
+    /// The pass XP required to advance one tier. With monotonically increasing
+    /// thresholds this yields a strictly increasing tier as XP accrues.
+    xp_per_tier: u64,
 }
 
 impl BattlePass {
@@ -258,6 +336,9 @@ impl BattlePass {
             awards_cosmetics_or_credits_only: true,
             season_active: true,
             premium_track_start: 1,
+            total_xp: 0,
+            current_tier: 1,
+            xp_per_tier: 100,
         }
     }
 
@@ -269,6 +350,16 @@ impl BattlePass {
     /// The season this pass is bound to.
     pub fn season_id(&self) -> &str {
         &self.season_id
+    }
+
+    /// The player's accumulated pass XP.
+    pub fn total_xp(&self) -> u64 {
+        self.total_xp
+    }
+
+    /// The tier the pass has advanced to given its accumulated XP.
+    pub fn current_tier(&self) -> u32 {
+        self.current_tier
     }
 
     /// Current version (delegates to the embedded [`AggregateRoot`]).
@@ -324,6 +415,28 @@ impl BattlePass {
     /// season).
     pub fn set_season_active(&mut self, active: bool) {
         self.season_active = active;
+    }
+
+    /// Set the player's accumulated pass XP and the tier derived from it.
+    pub fn set_total_xp(&mut self, total_xp: u64) {
+        self.total_xp = total_xp;
+        self.current_tier = self.tier_for_xp(total_xp);
+    }
+
+    /// Set the pass XP required to advance one tier. Must be non-zero.
+    pub fn set_xp_per_tier(&mut self, xp_per_tier: u64) {
+        self.xp_per_tier = xp_per_tier;
+        self.current_tier = self.tier_for_xp(self.total_xp);
+    }
+
+    /// The tier reached at `total_xp` given the pass's XP ladder. Tier 1 is the
+    /// starting tier; every [`Self::xp_per_tier`] of XP advances one tier, so the
+    /// tier is monotonically non-decreasing in XP.
+    fn tier_for_xp(&self, total_xp: u64) -> u32 {
+        // A zero XP-per-tier ladder cannot advance; guard the division.
+        let steps = total_xp.checked_div(self.xp_per_tier).unwrap_or(0);
+        // Saturate into u32; tiers are small in practice.
+        1u32.saturating_add(u32::try_from(steps).unwrap_or(u32::MAX - 1))
     }
 
     /// Monotonicity invariant: XP thresholds are monotonically increasing across
@@ -529,6 +642,66 @@ impl BattlePass {
         self.root.record(Box::new(event.clone()));
         Ok(vec![event])
     }
+
+    /// Handle `ProgressPassCmd`: verify the command carries a valid playerId, a
+    /// valid seasonId (naming this pass's season), and a valid (non-zero) xpDelta;
+    /// enforce every invariant (XP thresholds monotonic, unlock-in-track-order,
+    /// premium after purchase, cosmetics / credits only, and season bound /
+    /// active); add the XP and advance the tier; and emit
+    /// [`Event::PassProgressed`].
+    fn progress_pass(&mut self, cmd: ProgressPass) -> Result<Vec<Event>, DomainError> {
+        // A valid playerId must be supplied.
+        if cmd.player_id.trim().is_empty() {
+            return Err(DomainError::InvariantViolation(format!(
+                "battle pass '{}' requires a valid playerId to progress the pass",
+                self.id
+            )));
+        }
+        // A valid seasonId must be supplied.
+        if cmd.season_id.trim().is_empty() {
+            return Err(DomainError::InvariantViolation(format!(
+                "battle pass '{}' requires a valid seasonId to progress the pass",
+                self.id
+            )));
+        }
+        // The command must name the season this pass is bound to — a pass is
+        // bound to a single season.
+        if cmd.season_id != self.season_id {
+            return Err(DomainError::InvariantViolation(format!(
+                "command targets season '{}' but battle pass '{}' is bound to season '{}'; a pass \
+                 is bound to a single season and expires with it",
+                cmd.season_id, self.id, self.season_id
+            )));
+        }
+        // A valid (non-zero) xpDelta must be supplied.
+        if cmd.xp_delta == 0 {
+            return Err(DomainError::InvariantViolation(format!(
+                "battle pass '{}' requires a valid (non-zero) xpDelta to progress the pass",
+                self.id
+            )));
+        }
+
+        // Enforce every invariant before recording progression.
+        self.ensure_xp_thresholds_monotonic()?;
+        self.ensure_reward_nodes_unlock_in_track_order()?;
+        self.ensure_premium_track_claimable_only_after_purchase()?;
+        self.ensure_awards_cosmetics_or_credits_only()?;
+        self.ensure_season_active()?;
+
+        // Add the XP and advance the tier along the monotonic ladder.
+        self.total_xp = self.total_xp.saturating_add(cmd.xp_delta);
+        self.current_tier = self.tier_for_xp(self.total_xp);
+
+        let event = Event::PassProgressed(PassProgressed {
+            player_id: cmd.player_id,
+            season_id: cmd.season_id,
+            xp_delta: cmd.xp_delta,
+            total_xp: self.total_xp,
+            tier: self.current_tier,
+        });
+        self.root.record(Box::new(event.clone()));
+        Ok(vec![event])
+    }
 }
 
 impl Aggregate for BattlePass {
@@ -557,6 +730,14 @@ impl Aggregate for BattlePass {
                         ))
                     })?;
                 self.claim_pass_reward(cmd)
+            }
+            PROGRESS_PASS => {
+                let cmd: ProgressPass = serde_json::from_slice(&command.payload).map_err(|e| {
+                    DomainError::InvariantViolation(format!(
+                        "malformed ProgressPassCmd payload: {e}"
+                    ))
+                })?;
+                self.progress_pass(cmd)
             }
             // Any other command is unknown to this aggregate.
             _ => Err(DomainError::unknown_command(
@@ -608,6 +789,11 @@ mod tests {
     /// using fiat Order `o-01`.
     fn valid_purchase_cmd() -> PurchaseBattlePass {
         PurchaseBattlePass::new("p-01", "s-01", "o-01")
+    }
+
+    /// A command adding 150 pass XP for player `p-01` in season `s-01`.
+    fn valid_progress_cmd() -> ProgressPass {
+        ProgressPass::new("p-01", "s-01", 150)
     }
 
     // Scenario: Successfully execute PurchaseBattlePassCmd.
@@ -945,5 +1131,167 @@ mod tests {
         assert_eq!(command.name, ClaimPassReward::COMMAND);
         let decoded: ClaimPassReward = serde_json::from_slice(&command.payload).unwrap();
         assert_eq!(decoded, valid_cmd());
+    }
+
+    // Scenario: Successfully execute ProgressPassCmd.
+    #[test]
+    fn progresses_and_emits_pass_progressed_event() {
+        let mut pass = ready_pass();
+
+        let events = pass
+            .execute(valid_progress_cmd().into_command())
+            .expect("valid progression should succeed");
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_type(), "pass.progressed");
+        match &events[0] {
+            Event::PassProgressed(progressed) => {
+                assert_eq!(progressed.player_id, "p-01");
+                assert_eq!(progressed.season_id, "s-01");
+                assert_eq!(progressed.xp_delta, 150);
+                assert_eq!(progressed.total_xp, 150);
+                // 150 XP at the default 100 XP/tier advances from tier 1 to tier 2.
+                assert_eq!(progressed.tier, 2);
+            }
+            other => panic!("expected PassProgressed, got {other:?}"),
+        }
+        // The BattlePass recorded the event and advanced its XP / tier.
+        assert_eq!(pass.version(), 1);
+        assert_eq!(pass.total_xp(), 150);
+        assert_eq!(pass.current_tier(), 2);
+        assert_eq!(pass.uncommitted_events().len(), 1);
+        assert_eq!(pass.uncommitted_events()[0].event_type(), "pass.progressed");
+    }
+
+    // Progressing repeatedly accumulates XP and advances tiers monotonically.
+    #[test]
+    fn progress_accumulates_xp_across_tiers() {
+        let mut pass = ready_pass();
+
+        pass.execute(ProgressPass::new("p-01", "s-01", 60).into_command())
+            .expect("first progression should succeed");
+        assert_eq!(pass.total_xp(), 60);
+        assert_eq!(pass.current_tier(), 1);
+
+        pass.execute(ProgressPass::new("p-01", "s-01", 60).into_command())
+            .expect("second progression should succeed");
+        assert_eq!(pass.total_xp(), 120);
+        assert_eq!(pass.current_tier(), 2);
+        assert_eq!(pass.version(), 2);
+    }
+
+    // Scenario: ProgressPassCmd rejected — XP thresholds are monotonically
+    // increasing across tiers.
+    #[test]
+    fn progress_rejects_when_xp_thresholds_not_monotonic() {
+        let mut pass = ready_pass();
+        // The tier ladder's XP thresholds are out of order.
+        pass.set_xp_thresholds_monotonic(false);
+
+        let err = pass
+            .execute(valid_progress_cmd().into_command())
+            .expect_err("a non-monotonic XP ladder must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(pass.version(), 0);
+    }
+
+    // Scenario: ProgressPassCmd rejected — Reward nodes unlock strictly in track
+    // order.
+    #[test]
+    fn progress_rejects_when_reward_nodes_do_not_unlock_in_track_order() {
+        let mut pass = ready_pass();
+        // The reward track is malformed and can unlock nodes out of order.
+        pass.set_reward_nodes_unlock_in_track_order(false);
+
+        let err = pass
+            .execute(valid_progress_cmd().into_command())
+            .expect_err("an out-of-order reward track must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(pass.version(), 0);
+    }
+
+    // Scenario: ProgressPassCmd rejected — The premium track is claimable only
+    // after purchase.
+    #[test]
+    fn progress_rejects_when_premium_track_is_claimable_before_purchase() {
+        let mut pass = ready_pass();
+        // The premium track is incorrectly exposed before purchase.
+        pass.set_premium_track_claimable_only_after_purchase(false);
+
+        let err = pass
+            .execute(valid_progress_cmd().into_command())
+            .expect_err("premium rewards exposed before purchase must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(pass.version(), 0);
+    }
+
+    // Scenario: ProgressPassCmd rejected — The pass awards cosmetics and $MADE
+    // credits only — never gameplay power.
+    #[test]
+    fn progress_rejects_when_node_grants_gameplay_power() {
+        let mut pass = ready_pass();
+        // The reward node is wired to grant gameplay power.
+        pass.set_awards_cosmetics_or_credits_only(false);
+
+        let err = pass
+            .execute(valid_progress_cmd().into_command())
+            .expect_err("a node granting gameplay power must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(pass.version(), 0);
+    }
+
+    // Scenario: ProgressPassCmd rejected — A pass is bound to a single season and
+    // expires with it.
+    #[test]
+    fn progress_rejects_when_season_expired() {
+        let mut pass = ready_pass();
+        // The season the pass is bound to has expired.
+        pass.set_season_active(false);
+
+        let err = pass
+            .execute(valid_progress_cmd().into_command())
+            .expect_err("progression against an expired season must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(pass.version(), 0);
+    }
+
+    // A ProgressPassCmd naming a different season is rejected — a pass is bound to
+    // a single season.
+    #[test]
+    fn progress_rejects_command_for_a_different_season() {
+        let mut pass = ready_pass();
+        let cmd = ProgressPass::new("p-01", "s-99", 150);
+
+        let err = pass
+            .execute(cmd.into_command())
+            .expect_err("progression for another season must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(pass.version(), 0);
+    }
+
+    // Commands missing required fields (or a zero xpDelta) are rejected.
+    #[test]
+    fn progress_rejects_command_with_missing_fields() {
+        for cmd in [
+            ProgressPass::new("   ", "s-01", 150),
+            ProgressPass::new("p-01", "   ", 150),
+            ProgressPass::new("p-01", "s-01", 0),
+        ] {
+            let mut pass = ready_pass();
+            let err = pass
+                .execute(cmd.into_command())
+                .expect_err("a command with a missing field must be rejected");
+            assert!(matches!(err, DomainError::InvariantViolation(_)));
+            assert_eq!(pass.version(), 0);
+        }
+    }
+
+    #[test]
+    fn progress_command_payload_round_trips() {
+        let cmd = valid_progress_cmd();
+        let command = cmd.into_command();
+        assert_eq!(command.name, ProgressPass::COMMAND);
+        let decoded: ProgressPass = serde_json::from_slice(&command.payload).unwrap();
+        assert_eq!(decoded, valid_progress_cmd());
     }
 }
