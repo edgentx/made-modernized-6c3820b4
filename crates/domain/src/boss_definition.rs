@@ -15,17 +15,22 @@
 //! 4. **Authoritative roster** — the published roster must contain *exactly*
 //!    [`AUTHORITATIVE_ROSTER_SIZE`] Bosses before a launch is validated.
 //!
-//! Two commands are implemented. [`DefineBoss`] (`DefineBossCmd`) creates a Boss
+//! Three commands are implemented. [`DefineBoss`] (`DefineBossCmd`) creates a Boss
 //! definition — its name, starting HP, single hero power and single trademark,
 //! plus the signature card set it is launched with — enforcing all four
 //! invariants and, on success, emitting [`Event::BossDefined`] (`boss.defined`).
 //! [`AssignSignatureCards`] (`AssignSignatureCardsCmd`) rebinds a Boss's
 //! signature card set from valid card definitions, enforcing the same four
 //! invariants, and on success emits [`Event::SignatureAssigned`]
-//! (`boss.signature.assigned`). This module is hand-written (it no longer uses
-//! `shared::stub_aggregate!`) but preserves the same public surface — a
-//! [`BossDefinition`] aggregate and a [`BossDefinitionRepository`] port — so the
-//! persistence adapters in `crates/mocks` keep compiling unchanged.
+//! (`boss.signature.assigned`). [`ValidateBossRoster`] (`ValidateBossRosterCmd`)
+//! asserts the full 18-Boss roster is complete and legal — re-checking all four
+//! invariants against the Boss's standing state and cross-checking the caller's
+//! `expectedCount` against the published roster — and on success emits
+//! [`Event::RosterValidated`] (`boss.roster.validated`). This module is
+//! hand-written (it no longer uses `shared::stub_aggregate!`) but preserves the
+//! same public surface — a [`BossDefinition`] aggregate and a
+//! [`BossDefinitionRepository`] port — so the persistence adapters in
+//! `crates/mocks` keep compiling unchanged.
 
 use std::collections::BTreeSet;
 
@@ -42,6 +47,10 @@ const DEFINE_BOSS: &str = "DefineBossCmd";
 
 /// The command name [`BossDefinition::execute`] recognizes.
 const ASSIGN_SIGNATURE_CARDS: &str = "AssignSignatureCardsCmd";
+
+/// The command name [`BossDefinition::execute`] recognizes for validating that
+/// the full published roster is complete and legal.
+const VALIDATE_BOSS_ROSTER: &str = "ValidateBossRosterCmd";
 
 /// The inclusive `[min, max]` legal range for a Boss's starting HP. Bosses are
 /// beefier than players, but a launch-valid Boss must still sit inside these
@@ -166,6 +175,63 @@ pub struct SignatureAssigned {
     pub signature_card_ids: Vec<String>,
 }
 
+/// The `ValidateBossRosterCmd` payload: a request to assert that the full
+/// published roster is complete and legal before a launch. Field names are the
+/// catalog's `camelCase` schema.
+///
+/// The command carries no Boss shape of its own — it asserts against the Boss's
+/// standing state — but it does carry the roster being validated and the count
+/// the caller expects on it, so a mismatch between the expectation and the
+/// published roster is itself a rejection.
+///
+/// Build one directly and turn it into a [`Command`] with
+/// [`ValidateBossRoster::into_command`], or decode it from a command payload via
+/// [`serde_json`] inside [`BossDefinition::execute`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ValidateBossRoster {
+    /// Identity of the roster being validated; must be non-empty.
+    pub roster_id: String,
+    /// The number of Bosses the caller expects on the roster. Must equal the
+    /// Boss's published roster size, which in turn must be
+    /// [`AUTHORITATIVE_ROSTER_SIZE`].
+    pub expected_count: usize,
+}
+
+impl ValidateBossRoster {
+    /// The command name this maps to.
+    pub const COMMAND: &'static str = VALIDATE_BOSS_ROSTER;
+
+    /// Build a command validating roster `roster_id` against `expected_count`.
+    pub fn new(roster_id: impl Into<String>, expected_count: usize) -> Self {
+        Self {
+            roster_id: roster_id.into(),
+            expected_count,
+        }
+    }
+
+    /// Encode this command as a [`shared::Command`] carrying a JSON payload,
+    /// ready to hand to [`BossDefinition::execute`].
+    pub fn into_command(&self) -> Command {
+        // Serialization of a plain data struct to a Vec cannot fail here.
+        let payload = serde_json::to_vec(self).expect("ValidateBossRoster is always serializable");
+        Command::with_payload(Self::COMMAND, payload)
+    }
+}
+
+/// The proven-legal outcome of a roster validation, carried by
+/// [`Event::RosterValidated`] and thus by the emitted `boss.roster.validated`
+/// event.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RosterValidated {
+    /// The Boss whose validation asserted the roster.
+    pub boss_id: String,
+    /// The roster that was validated.
+    pub roster_id: String,
+    /// The proven-legal Boss count on the validated roster.
+    pub validated_count: usize,
+}
+
 /// Domain events emitted by [`BossDefinition`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Event {
@@ -173,6 +239,8 @@ pub enum Event {
     BossDefined(BossDefined),
     /// A Boss's signature card set passed every invariant and was bound.
     SignatureAssigned(SignatureAssigned),
+    /// The full published roster passed every invariant and was validated.
+    RosterValidated(RosterValidated),
 }
 
 impl DomainEvent for Event {
@@ -180,6 +248,7 @@ impl DomainEvent for Event {
         match self {
             Event::BossDefined(_) => "boss.defined",
             Event::SignatureAssigned(_) => "boss.signature.assigned",
+            Event::RosterValidated(_) => "boss.roster.validated",
         }
     }
 }
@@ -215,6 +284,10 @@ pub struct BossDefinition {
     /// The catalog of valid [`CardDefinition`](crate::card_definition) ids a
     /// signature card must be drawn from.
     valid_card_ids: BTreeSet<String>,
+    /// The Boss's currently-bound signature card set. Empty until a
+    /// `DefineBossCmd` or `AssignSignatureCardsCmd` binds one; a
+    /// `ValidateBossRosterCmd` re-checks it against the signature-set invariant.
+    signature_card_ids: Vec<String>,
     /// The number of Bosses on the published roster; must equal
     /// [`AUTHORITATIVE_ROSTER_SIZE`] for a launch to validate.
     published_roster_size: usize,
@@ -234,6 +307,7 @@ impl BossDefinition {
             trademarks: Vec::new(),
             starting_hp: 0,
             valid_card_ids: BTreeSet::new(),
+            signature_card_ids: Vec::new(),
             published_roster_size: 0,
         }
     }
@@ -284,6 +358,17 @@ impl BossDefinition {
         S: Into<String>,
     {
         self.valid_card_ids = ids.into_iter().map(Into::into).collect();
+    }
+
+    /// Bind the Boss's currently-held signature card set. Mirrors the state a
+    /// successful `DefineBossCmd`/`AssignSignatureCardsCmd` leaves behind, so a
+    /// `ValidateBossRosterCmd` has a signature set to re-check.
+    pub fn set_signature_card_ids<I, S>(&mut self, ids: I)
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.signature_card_ids = ids.into_iter().map(Into::into).collect();
     }
 
     /// Set the size of the published roster this Boss belongs to.
@@ -420,6 +505,7 @@ impl BossDefinition {
         self.hero_powers = cmd.hero_powers;
         self.trademarks = cmd.trademarks;
         self.starting_hp = cmd.starting_hp;
+        self.signature_card_ids = cmd.signature_card_ids.clone();
 
         let event = Event::BossDefined(BossDefined {
             boss_id: cmd.boss_id,
@@ -455,9 +541,58 @@ impl BossDefinition {
         // Then the invariant carried by the command itself.
         self.ensure_signature_set(&cmd.signature_card_ids)?;
 
+        // Bind the proven-valid set to aggregate state so a later roster
+        // validation re-checks the signature set this command established.
+        self.signature_card_ids = cmd.signature_card_ids.clone();
+
         let event = Event::SignatureAssigned(SignatureAssigned {
             boss_id: cmd.boss_id,
             signature_card_ids: cmd.signature_card_ids,
+        });
+        self.root.record(Box::new(event.clone()));
+        Ok(vec![event])
+    }
+
+    /// Handle `ValidateBossRosterCmd`: assert the full published roster is
+    /// complete and legal by re-checking all four Boss invariants against the
+    /// Boss's standing state, cross-check the caller's `expected_count` against
+    /// the published roster, and — only if everything holds — emit
+    /// [`Event::RosterValidated`].
+    ///
+    /// This is a read-only assertion over aggregate state: no field is mutated,
+    /// and any failing invariant short-circuits via `?` so a rejected command
+    /// records no event and leaves the version unchanged.
+    fn validate_boss_roster(&mut self, cmd: ValidateBossRoster) -> Result<Vec<Event>, DomainError> {
+        // A validation must target a named roster.
+        if cmd.roster_id.trim().is_empty() {
+            return Err(DomainError::InvariantViolation(
+                "a roster validation must target a non-empty rosterId".to_string(),
+            ));
+        }
+
+        // Re-check the four launch invariants against the Boss's standing state,
+        // in the order the acceptance criteria enumerate them.
+        self.ensure_signature_shape()?;
+        self.ensure_signature_set(&self.signature_card_ids)?;
+        self.ensure_legal_hp()?;
+        self.ensure_authoritative_roster()?;
+
+        // Cross-check the caller's expectation against the published roster; the
+        // authoritative-roster invariant above already pins it to
+        // AUTHORITATIVE_ROSTER_SIZE, so this rejects a caller who expects a
+        // different number.
+        if cmd.expected_count != self.published_roster_size {
+            return Err(DomainError::InvariantViolation(format!(
+                "the published roster must contain exactly {AUTHORITATIVE_ROSTER_SIZE} Bosses \
+                 before a launch is validated; caller expected {} but the roster holds {}",
+                cmd.expected_count, self.published_roster_size
+            )));
+        }
+
+        let event = Event::RosterValidated(RosterValidated {
+            boss_id: self.boss_id.clone(),
+            roster_id: cmd.roster_id,
+            validated_count: self.published_roster_size,
         });
         self.root.record(Box::new(event.clone()));
         Ok(vec![event])
@@ -487,6 +622,15 @@ impl Aggregate for BossDefinition {
                         ))
                     })?;
                 self.assign_signature_cards(cmd)
+            }
+            VALIDATE_BOSS_ROSTER => {
+                let cmd: ValidateBossRoster =
+                    serde_json::from_slice(&command.payload).map_err(|e| {
+                        DomainError::InvariantViolation(format!(
+                            "malformed ValidateBossRosterCmd payload: {e}"
+                        ))
+                    })?;
+                self.validate_boss_roster(cmd)
             }
             // Any other command is unknown to this aggregate.
             _ => Err(DomainError::unknown_command(
@@ -796,5 +940,128 @@ mod tests {
         assert_eq!(command.name, AssignSignatureCards::COMMAND);
         let decoded: AssignSignatureCards = serde_json::from_slice(&command.payload).unwrap();
         assert_eq!(decoded, valid_cmd());
+    }
+
+    /// A launch-valid Boss with a signature card set already bound, ready for a
+    /// roster validation. Builds on [`valid_boss`] and adds the standing
+    /// signature set a `ValidateBossRosterCmd` re-checks.
+    fn valid_roster_boss() -> BossDefinition {
+        let mut boss = valid_boss();
+        boss.set_signature_card_ids(["card-001", "card-002"]);
+        boss
+    }
+
+    /// A `ValidateBossRosterCmd` expecting the authoritative 18-Boss roster.
+    fn valid_validate_cmd() -> ValidateBossRoster {
+        ValidateBossRoster::new("roster-launch", AUTHORITATIVE_ROSTER_SIZE)
+    }
+
+    // Scenario: Successfully execute ValidateBossRosterCmd.
+    #[test]
+    fn validates_roster_and_emits_boss_roster_validated_event() {
+        let mut boss = valid_roster_boss();
+
+        let events = boss
+            .execute(valid_validate_cmd().into_command())
+            .expect("a valid roster should validate");
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_type(), "boss.roster.validated");
+        match &events[0] {
+            Event::RosterValidated(validated) => {
+                assert_eq!(validated.boss_id, "boss-01");
+                assert_eq!(validated.roster_id, "roster-launch");
+                assert_eq!(validated.validated_count, AUTHORITATIVE_ROSTER_SIZE);
+            }
+            other => panic!("expected RosterValidated, got {other:?}"),
+        }
+        assert_eq!(boss.version(), 1);
+        assert_eq!(boss.uncommitted_events().len(), 1);
+        assert_eq!(
+            boss.uncommitted_events()[0].event_type(),
+            "boss.roster.validated"
+        );
+    }
+
+    // Scenario: rejected — every Boss has exactly one hero power and exactly one
+    // trademark.
+    #[test]
+    fn validate_rejects_when_boss_has_more_than_one_hero_power() {
+        let mut boss = valid_roster_boss();
+        // A second hero power breaks the exactly-one shape.
+        boss.declare_hero_power("Second Wind");
+
+        let err = boss
+            .execute(valid_validate_cmd().into_command())
+            .expect_err("a Boss with two hero powers must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(boss.version(), 0);
+    }
+
+    // Scenario: rejected — every Boss must be assigned a non-empty signature card
+    // set drawn from valid CardDefinitions.
+    #[test]
+    fn validate_rejects_empty_signature_card_set() {
+        let mut boss = valid_roster_boss();
+        // Strip the bound signature set to violate the signature-set invariant.
+        boss.set_signature_card_ids(Vec::<String>::new());
+
+        let err = boss
+            .execute(valid_validate_cmd().into_command())
+            .expect_err("an empty signature set must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(boss.version(), 0);
+    }
+
+    // Scenario: rejected — Boss starting HP must fall within the legal HP bounds.
+    #[test]
+    fn validate_rejects_starting_hp_outside_legal_bounds() {
+        let mut boss = valid_roster_boss();
+        // One past the legal maximum.
+        boss.set_starting_hp(LEGAL_STARTING_HP.end() + 1);
+
+        let err = boss
+            .execute(valid_validate_cmd().into_command())
+            .expect_err("HP outside the legal bounds must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(boss.version(), 0);
+    }
+
+    // Scenario: rejected — the published roster must contain exactly the
+    // authoritative 18 Bosses before a launch is validated.
+    #[test]
+    fn validate_rejects_when_published_roster_is_not_authoritative_size() {
+        let mut boss = valid_roster_boss();
+        // One short of the authoritative roster.
+        boss.set_published_roster_size(AUTHORITATIVE_ROSTER_SIZE - 1);
+
+        let err = boss
+            .execute(valid_validate_cmd().into_command())
+            .expect_err("an incomplete roster must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(boss.version(), 0);
+    }
+
+    // A caller whose expected_count disagrees with the published roster is
+    // rejected even when the roster is otherwise the authoritative size.
+    #[test]
+    fn validate_rejects_when_expected_count_mismatches_published_roster() {
+        let mut boss = valid_roster_boss();
+        let cmd = ValidateBossRoster::new("roster-launch", AUTHORITATIVE_ROSTER_SIZE + 1);
+
+        let err = boss
+            .execute(cmd.into_command())
+            .expect_err("a mismatched expected count must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(boss.version(), 0);
+    }
+
+    #[test]
+    fn validate_command_payload_round_trips() {
+        let cmd = valid_validate_cmd();
+        let command = cmd.into_command();
+        assert_eq!(command.name, ValidateBossRoster::COMMAND);
+        let decoded: ValidateBossRoster = serde_json::from_slice(&command.payload).unwrap();
+        assert_eq!(decoded, valid_validate_cmd());
     }
 }
