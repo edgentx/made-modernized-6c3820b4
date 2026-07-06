@@ -24,18 +24,18 @@
 //! the container image sets `BIND_ADDR=0.0.0.0:8080` so the service is reachable
 //! from outside the container.
 
-mod http;
+// `/metrics` and the request counter are a process-level *operational* surface,
+// not part of the domain route table the integration suite mounts, so they stay
+// binary-local here while the domain wiring lives in `server::configure`.
 mod metrics;
-mod ws;
 
 use actix_web::dev::Service;
-use actix_web::{get, web, App, HttpResponse, HttpServer, Responder};
+use actix_web::{web, App, HttpServer};
 
-/// Liveness probe.
-#[get("/health")]
-async fn health() -> impl Responder {
-    HttpResponse::Ok().body("ok")
-}
+// The REST/WS surfaces and the shared route assembly are exposed by the `server`
+// library so this binary and the `tests/` integration suite mount the identical
+// wiring.
+use server::{configure, http, ws};
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
@@ -80,19 +80,18 @@ async fn main() -> std::io::Result<()> {
             .app_data(api_state.clone())
             .app_data(ws_state.clone())
             .app_data(metrics.clone())
-            // Malformed JSON bodies render the same structured 400 envelope as a
-            // failed field validation.
-            .app_data(http::json_config())
             // Count every accepted request before dispatch so /metrics reflects
             // total traffic across all surfaces.
             .wrap_fn(move |req, srv| {
                 metrics_mw.incr_request();
                 srv.call(req)
             })
-            .service(health)
+            // Operational scrape target, kept binary-local (see module note above).
             .service(metrics::metrics)
-            .route("/ws", web::get().to(ws::game_ws))
-            .configure(http::configure)
+            // The domain route table (health, malformed-body handler, `/ws`,
+            // `/v1`) is assembled by `server::configure` so the integration
+            // suite mounts the identical wiring this binary serves.
+            .configure(configure)
     })
     .bind(bind_addr)?
     .run()

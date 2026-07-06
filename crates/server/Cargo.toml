@@ -10,6 +10,16 @@ description = "Authoritative game server (actix-web + actix-ws). Driving adapter
 name = "made-server"
 path = "src/main.rs"
 
+[features]
+# The API-level integration suite (`tests/`) drives the REST + WS surfaces
+# against *live* Postgres + Redis service containers. It is gated behind this
+# off-by-default feature exactly as the persistence adapter suite is, so the
+# DB-free `build-and-test` CI job — which runs `cargo test --workspace` with no
+# database or Redis in reach — compiles the (empty, cfg'd-out) test targets
+# without trying to run them. The `api-integration` CI job stands both services
+# up and enables this feature to exercise the whole suite for real.
+integration-tests = []
+
 [dependencies]
 shared = { workspace = true }
 domain = { workspace = true }
@@ -25,3 +35,19 @@ serde_json = "1"
 # The authoritative match hub fans deltas out over a `tokio::sync::broadcast`
 # channel; actix already runs on tokio, so this only pulls in the sync feature.
 tokio = { version = "1", features = ["sync"] }
+
+[dev-dependencies]
+# The API-level integration suite. `sqlx` supplies `#[sqlx::test]`, which
+# provisions an ephemeral Postgres database per test and runs the embedded
+# migrations before injecting a `PgPool` — the same harness the persistence
+# adapter suite uses. The internal crates (persistence, ephemeral, domain,
+# game-session, mocks) and actix-web are already normal dependencies and are in
+# scope for the tests, so they are not repeated here.
+sqlx = { version = "0.8", default-features = false, features = [
+    "runtime-tokio",
+    "tls-rustls",
+    "postgres",
+    "macros",
+    "migrate",
+] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
