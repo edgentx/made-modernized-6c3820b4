@@ -1,0 +1,41 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT player_id, rating, tier, stars\n        FROM ranked_standings\n        WHERE season_id = $1\n        ORDER BY rating DESC\n        LIMIT $2\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "player_id",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 1,
+        "name": "rating",
+        "type_info": "Float8"
+      },
+      {
+        "ordinal": 2,
+        "name": "tier",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 3,
+        "name": "stars",
+        "type_info": "Int2"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "0306d4fe8a0d96513890518538ce56de2802fb06044493cc913972e1b5c79473"
+}

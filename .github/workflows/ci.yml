@@ -62,3 +62,50 @@ jobs:
           cache-dependency-path: web/package-lock.json
       - run: npm ci
       - run: npm run build
+
+  # Apply the sqlx migrations to a throwaway Postgres service container to prove
+  # they migrate a *fresh* database cleanly in forward order, then verify the
+  # committed offline query metadata (`.sqlx/`) is current against that schema.
+  migrations:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: made
+          POSTGRES_PASSWORD: made
+          POSTGRES_DB: made
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U made"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      DATABASE_URL: postgres://made:made@localhost:5432/made
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install sqlx-cli
+        run: cargo install sqlx-cli --version "^0.8" --no-default-features --features rustls,postgres --locked
+
+      # Forward-only apply against the fresh service container.
+      - name: Run migrations (fresh DB, forward order)
+        run: sqlx migrate run --source migrations
+
+      # The runner binary is the local twin of the CLI; prove it is wired too.
+      - name: Run migrations via the made-migrate binary (idempotent)
+        run: cargo run -p persistence --bin made-migrate
+
+      # Fail if a query changed but `cargo sqlx prepare` was not re-run. Setting
+      # DATABASE_URL (a real env var) overrides the offline default from
+      # .cargo/config.toml, so the check validates queries live against the DB.
+      - name: Verify offline query metadata is current
+        run: cargo sqlx prepare --workspace --check
