@@ -15,12 +15,23 @@
 //! * [`leaderboard`] — the hot ranked-standings read path, expressed as a
 //!   compile-time-checked query so its shape is validated against the schema at
 //!   build time (and cached as offline metadata under `.sqlx/` for CI).
+//! * [`repositories`] — the sqlx-backed repository adapters for every durable
+//!   aggregate: row mapping, optimistic-concurrency writes that surface a typed
+//!   [`RepositoryError::Conflict`], and transactions for the multi-row
+//!   invariants (the emission ledger, collection grants, pack opening, an order
+//!   and its line items). See that module's docs for why they are async,
+//!   owned-value adapters rather than literal `impl shared::Repository`.
 //!
 //! PostgreSQL is non-substitutable for MADE per the hard platform constraint;
 //! there is intentionally no other backend behind these ports.
 
 use sqlx::migrate::Migrator;
 use sqlx::postgres::{PgPool, PgPoolOptions};
+
+pub mod error;
+pub mod repositories;
+
+pub use error::RepositoryError;
 
 /// The versioned migration set, embedded at compile time from the repo-root
 /// `migrations/` directory. [`run_migrations`] applies it; the very same files
