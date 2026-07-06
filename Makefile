@@ -1,4 +1,4 @@
-.PHONY: build test wasm run fmt clippy check migrate sqlx-prepare web-image web-run
+.PHONY: build test wasm run fmt clippy check migrate sqlx-prepare web-image web-run server-image server-run
 
 # Build every crate and target (including test targets).
 build:
@@ -27,6 +27,19 @@ web-image:
 # Run the image locally on http://localhost:8080 (health check at /healthz).
 web-run: web-image
 	docker run --rm -p 8080:8080 made-pwa:local
+
+# Build the production backend image (`made-server`): cargo release build against
+# the committed sqlx offline metadata, into a slim non-root Debian runtime.
+# Context is the repo root because the build needs the whole workspace, .sqlx/,
+# and migrations/.
+server-image:
+	docker build -f crates/server/Dockerfile -t made-server:local .
+
+# Run the backend image locally on http://localhost:8080 (health at /health,
+# Prometheus scrape at /metrics). Postgres/Redis connect lazily / fail soft, so
+# it serves its probes with no backing services in reach.
+server-run: server-image
+	docker run --rm -p 8080:8080 made-server:local
 
 # Apply the sqlx migrations to $DATABASE_URL (local dev + CI share these files).
 # e.g. DATABASE_URL=postgres://made:made@localhost:5432/made make migrate

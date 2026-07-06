@@ -17,10 +17,18 @@
 //! or the Kong/OPA sidecars. Auth is terminated by those sidecars upstream, so
 //! there is no auth middleware here — the handlers only read the identity the
 //! gateway injects.
+//!
+//! Two operational surfaces sit alongside the domain routes: `/health` (liveness)
+//! and `/metrics` (the Prometheus scrape target, see [`metrics`]). The listen
+//! address is taken from `BIND_ADDR` (default `127.0.0.1:8080` for local runs);
+//! the container image sets `BIND_ADDR=0.0.0.0:8080` so the service is reachable
+//! from outside the container.
 
 mod http;
+mod metrics;
 mod ws;
 
+use actix_web::dev::Service;
 use actix_web::{get, web, App, HttpResponse, HttpServer, Responder};
 
 /// Liveness probe.
@@ -52,25 +60,41 @@ async fn main() -> std::io::Result<()> {
 
     let api_state = web::Data::new(http::ApiState::new(pool.clone()));
     let ws_state = web::Data::new(ws::WsState::new(pool, redis));
+    // The metrics registry is shared across every worker so counts aggregate
+    // process-wide, not per worker.
+    let metrics = web::Data::new(metrics::Metrics::new());
 
-    let addr = ("127.0.0.1", 8080);
+    // Bind address is env-configurable so the same binary listens on loopback
+    // locally and on 0.0.0.0 in a container (the image sets BIND_ADDR).
+    let bind_addr = std::env::var("BIND_ADDR").unwrap_or_else(|_| "127.0.0.1:8080".to_string());
     println!(
-        "MADE game server listening on http://{}:{} (REST /v1, ws /ws)",
-        addr.0, addr.1
+        "MADE game server listening on http://{} (REST /v1, ws /ws, /metrics)",
+        bind_addr
     );
 
     HttpServer::new(move || {
+        // Per-worker clone of the shared registry, captured by the request-
+        // counting middleware below.
+        let metrics_mw = metrics.clone();
         App::new()
             .app_data(api_state.clone())
             .app_data(ws_state.clone())
+            .app_data(metrics.clone())
             // Malformed JSON bodies render the same structured 400 envelope as a
             // failed field validation.
             .app_data(http::json_config())
+            // Count every accepted request before dispatch so /metrics reflects
+            // total traffic across all surfaces.
+            .wrap_fn(move |req, srv| {
+                metrics_mw.incr_request();
+                srv.call(req)
+            })
             .service(health)
+            .service(metrics::metrics)
             .route("/ws", web::get().to(ws::game_ws))
             .configure(http::configure)
     })
-    .bind(addr)?
+    .bind(bind_addr)?
     .run()
     .await
 }

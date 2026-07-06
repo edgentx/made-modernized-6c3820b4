@@ -157,6 +157,103 @@ jobs:
           DIST_DIR: ota-dist
         run: ./scripts/publish-ota.sh
 
+  # Build the production backend container image (`made-server`) and prove it
+  # boots into a passing health/smoke check. The image compiles against the
+  # committed sqlx offline metadata, so no database is needed at build time. On a
+  # push to main the validated image is tagged + pushed to the deploy-configured
+  # registry; on PRs it is built and smoke-tested but neither pushed (no secrets).
+  server-image:
+    runs-on: ubuntu-latest
+    needs: build-and-test
+    permissions:
+      contents: read
+      packages: write
+    env:
+      REGISTRY: ${{ vars.SERVER_REGISTRY || 'ghcr.io' }}
+      IMAGE_NAME: ${{ vars.SERVER_IMAGE_NAME || format('{0}/made-server', github.repository) }}
+      IS_RELEASE: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      # Version = workspace crate version + short commit sha (e.g. 0.1.0+1a2b3c4),
+      # reused as the image tag and the image label so the tag and provenance
+      # label are one identity.
+      - name: Compute image version
+        id: ver
+        run: |
+          SHORT="${GITHUB_SHA::7}"
+          CRATE_VER="$(grep -m1 -E '^version' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')"
+          echo "version=${CRATE_VER}+${SHORT}" >> "$GITHUB_OUTPUT"
+
+      - name: Docker metadata (tags + labels)
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=sha,format=long
+            type=raw,value=${{ steps.ver.outputs.version }}
+            type=raw,value=latest,enable=${{ env.IS_RELEASE }}
+
+      # Build and load into the local daemon (single-platform) so the smoke test
+      # can run the exact image bytes. Context is the repo root — the build needs
+      # the whole workspace, .sqlx/, and migrations/.
+      - name: Build image (load for smoke test)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: crates/server/Dockerfile
+          target: runtime
+          load: true
+          tags: made-server:ci
+          build-args: |
+            VERSION=${{ steps.ver.outputs.version }}
+          cache-from: type=gha,scope=server
+          cache-to: type=gha,mode=max,scope=server
+
+      # Boot the container and prove it serves a passing health check and the
+      # Prometheus scrape surface, with no Postgres/Redis in reach (both connect
+      # lazily / fail soft, so the process still binds and serves its probes).
+      - name: Container smoke / health check
+        run: |
+          docker run -d --name made-server-smoke -p 8080:8080 made-server:ci
+          ok=
+          for i in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:8080/health >/dev/null; then ok=1; break; fi
+            sleep 1
+          done
+          if [ -z "$ok" ]; then echo "health check never passed"; docker logs made-server-smoke; exit 1; fi
+          echo "/health OK"
+          curl -fsS http://127.0.0.1:8080/metrics | grep -q '^made_http_requests_total' \
+            || { echo "/metrics did not expose the prometheus surface"; docker logs made-server-smoke; exit 1; }
+          echo "/metrics OK"
+          docker rm -f made-server-smoke
+
+      - name: Log in to the registry
+        if: ${{ env.IS_RELEASE == 'true' }}
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ vars.SERVER_REGISTRY_USERNAME || github.actor }}
+          password: ${{ secrets.SERVER_REGISTRY_PASSWORD || secrets.GITHUB_TOKEN }}
+
+      # Push the cache-reused image on a main release only.
+      - name: Push image
+        if: ${{ env.IS_RELEASE == 'true' }}
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: crates/server/Dockerfile
+          target: runtime
+          push: true
+          build-args: |
+            VERSION=${{ steps.ver.outputs.version }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=server
+
   # Apply the sqlx migrations to a throwaway Postgres service container to prove
   # they migrate a *fresh* database cleanly in forward order, then verify the
   # committed offline query metadata (`.sqlx/`) is current against that schema.

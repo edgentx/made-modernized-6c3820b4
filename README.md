@@ -58,9 +58,23 @@ set of recognized command names.
 ## Commands
 
 ```sh
-make build   # cargo build --workspace --all-targets
-make test    # cargo test --workspace --no-run && cargo test --workspace
-make wasm    # wasm-pack build crates/game-session -- --features wasm
-make run     # run the actix-web + actix-ws game server on 127.0.0.1:8080
-make migrate # DATABASE_URL=... apply the sqlx migrations (local + CI)
+make build        # cargo build --workspace --all-targets
+make test         # cargo test --workspace --no-run && cargo test --workspace
+make wasm         # wasm-pack build crates/game-session -- --features wasm
+make run          # run the actix-web + actix-ws game server on 127.0.0.1:8080
+make migrate      # DATABASE_URL=... apply the sqlx migrations (local + CI)
+make server-image # build the backend container image (made-server)
+make server-run   # run it on :8080 (health at /health, metrics at /metrics)
+make web-image    # build the PWA container image (made-pwa)
 ```
+
+### Container images
+
+Two production images, both built from the repo root as build context:
+
+| Image | Dockerfile | Notes |
+|-------|------------|-------|
+| `made-server` | `crates/server/Dockerfile` | Multi-stage cargo release build of the authoritative game server into a slim, non-root Debian runtime. Compiles against the committed `.sqlx/` offline metadata (no DB at build time); embeds `migrations/` via `sqlx::migrate!`. Listens on `0.0.0.0:8080` (`BIND_ADDR`), serves `/health` (liveness) and `/metrics` (Prometheus). The seven bounded contexts are one binary, so this is one backend image. |
+| `made-pwa` | `web/Dockerfile` | The React PWA: compiles the shared rules crate to WASM with `wasm-pack`, runs the Vite build, serves the static bundle via rootless NGINX. |
+
+Both are built and (on a push to `main`) pushed by CI; the backend image additionally boots into a container health/smoke check on every run.
