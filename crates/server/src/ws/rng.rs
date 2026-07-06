@@ -124,7 +124,10 @@ mod tests {
         let mut b = SeededRng::new(2);
         let seq_a: Vec<u8> = (0..16).map(|_| a.next_cop_event()).collect();
         let seq_b: Vec<u8> = (0..16).map(|_| b.next_cop_event()).collect();
-        assert_ne!(seq_a, seq_b, "distinct seeds should not collide over 16 draws");
+        assert_ne!(
+            seq_a, seq_b,
+            "distinct seeds should not collide over 16 draws"
+        );
     }
 
     #[test]

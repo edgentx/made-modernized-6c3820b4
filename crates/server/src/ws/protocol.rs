@@ -226,6 +226,9 @@ mod tests {
             completed: false,
         };
         let bytes = serde_json::to_vec(&snap).unwrap();
-        assert_eq!(serde_json::from_slice::<MatchSnapshot>(&bytes).unwrap(), snap);
+        assert_eq!(
+            serde_json::from_slice::<MatchSnapshot>(&bytes).unwrap(),
+            snap
+        );
     }
 }

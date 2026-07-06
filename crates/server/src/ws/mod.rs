@@ -242,7 +242,11 @@ async fn on_applied(state: &WsState, match_id: &str, applied: Applied) {
     if let Some(redis) = &state.redis {
         // Mirror live state so a reconnect (even in another process) resumes it.
         if let Ok(bytes) = serde_json::to_vec(&applied.snapshot) {
-            if let Err(err) = redis.match_state().write_snapshot(match_id, &bytes, None).await {
+            if let Err(err) = redis
+                .match_state()
+                .write_snapshot(match_id, &bytes, None)
+                .await
+            {
                 eprintln!("failed to write live snapshot for '{match_id}': {err}");
             }
         }
