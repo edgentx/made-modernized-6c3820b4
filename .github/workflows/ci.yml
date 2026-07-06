@@ -349,6 +349,61 @@ jobs:
       - name: Verify offline query metadata is current
         run: cargo sqlx prepare --workspace --check
 
+  # The API-level integration gate (S-88): stand *both* an ephemeral Postgres and
+  # an ephemeral Redis up as service containers and drive the REST + WS surfaces
+  # against them through the production app wiring, with the trusted-gateway
+  # identity headers stubbed (no real auth — the sidecar contract). This job is a
+  # required check on every pull request, so an API regression fails the build.
+  #
+  # The suite is gated behind the server crate's `integration-tests` feature so
+  # the DB-free `build-and-test` job never tries to run it without a database or
+  # Redis; here both are provisioned, `#[sqlx::test]` provisions an ephemeral
+  # database per test via DATABASE_URL, and the WS match test mirrors live state
+  # to Redis via MADE_REDIS_URL.
+  api-integration:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: made
+          POSTGRES_PASSWORD: made
+          POSTGRES_DB: made
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U made"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+      redis:
+        image: redis:7
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      DATABASE_URL: postgres://made:made@localhost:5432/made
+      MADE_REDIS_URL: redis://127.0.0.1:6379
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      # Collection/deck, shop, and leaderboard REST endpoints (success + error
+      # cases, gateway headers injected) plus the full authoritative WS match:
+      # played to completion, its MatchReplay sealed to Postgres, live state
+      # mirrored to Redis, and the result reproduced from the seed.
+      - name: API-level integration tests (real Postgres + Redis)
+        run: cargo test -p server --features integration-tests
+
   # Render + lint the Helm chart against both environment overlays without a
   # cluster, so a template or values regression fails the PR. No secrets needed,
   # so this runs on every PR (unlike the deploy job below).
@@ -382,7 +437,7 @@ jobs:
   # secret) only on the release event keeps PRs from stalling on reviewers.
   deploy:
     runs-on: ubuntu-latest
-    needs: [build-and-test, migrations, web-image, server-image, content-validate]
+    needs: [build-and-test, migrations, api-integration, web-image, server-image, content-validate]
     environment: ${{ (github.event_name == 'push' && github.ref == 'refs/heads/main') && (vars.DEPLOY_ENV || 'prod') || '' }}
     env:
       IS_RELEASE: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}

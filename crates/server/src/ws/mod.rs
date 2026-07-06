@@ -225,7 +225,7 @@ async fn handle_action(
     session: &mut actix_ws::Session,
 ) {
     match state.hub.apply_action(match_id, command, payload) {
-        ApplyOutcome::Applied(applied) => on_applied(state, match_id, applied).await,
+        ApplyOutcome::Applied(applied) => persist_applied(state, match_id, applied).await,
         // A rejection (optimistic-state correction) or unknown-match error goes
         // only to the acting client; the deltas of an accepted command reach it
         // through its broadcast forwarder.
@@ -238,7 +238,12 @@ async fn handle_action(
 /// Persist the durable effects of an accepted command: mirror the live snapshot
 /// to Redis, re-publish the deltas on the match-event channel, and seal the
 /// replay durably when the match completed.
-async fn on_applied(state: &WsState, match_id: &str, applied: Applied) {
+///
+/// Public so the API-level integration suite can drive a full match through the
+/// hub and then run this *exact* durable path against real Postgres + Redis
+/// containers — the same code the `/ws` socket handler runs on every accepted
+/// action — rather than re-implementing the persistence side effects in a test.
+pub async fn persist_applied(state: &WsState, match_id: &str, applied: Applied) {
     if let Some(redis) = &state.redis {
         // Mirror live state so a reconnect (even in another process) resumes it.
         if let Ok(bytes) = serde_json::to_vec(&applied.snapshot) {
