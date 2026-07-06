@@ -18,4 +18,14 @@ interface ImportMetaEnv {
   readonly VITE_GATEWAY_SIGNIN_URL?: string
   readonly VITE_GATEWAY_SIGNOUT_URL?: string
   readonly VITE_GATEWAY_RETURN_PARAM?: string
+
+  // API / realtime endpoint config (see src/config/api.ts).
+  readonly VITE_API_ENV?: string
+  readonly VITE_API_PROJECT?: string
+  readonly VITE_API_BASE_URL?: string
+  readonly VITE_WS_BASE_URL?: string
+  readonly VITE_API_CAP_COLLECTION?: string
+  readonly VITE_API_CAP_LEADERBOARD?: string
+  readonly VITE_API_CAP_SHOP?: string
+  readonly VITE_API_CAP_CATALOG?: string
 }
