@@ -1,0 +1,26 @@
+[package]
+name = "persistence"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "PostgreSQL persistence adapter: the sqlx migration runner (local + CI) and typed read models over the domain schema."
+
+[lib]
+crate-type = ["rlib"]
+
+[[bin]]
+name = "made-migrate"
+path = "src/bin/migrate.rs"
+
+[dependencies]
+shared = { workspace = true }
+domain = { workspace = true }
+sqlx = { version = "0.8", default-features = false, features = [
+    "runtime-tokio",
+    "tls-rustls",
+    "postgres",
+    "macros",
+    "migrate",
+] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

@@ -1,0 +1,11 @@
+# Default every `cargo` invocation in this workspace to sqlx *offline* mode, so
+# the compile-time-checked queries in `crates/persistence` validate against the
+# committed `.sqlx/` metadata instead of requiring a live database. This keeps
+# `cargo build`, `make build`, and CI's build-and-test job green with no
+# Postgres in reach.
+#
+# This is a config-file default (force = false), so a real `SQLX_OFFLINE`
+# environment variable still wins — that is how `cargo sqlx prepare` (which sets
+# up its own connection via DATABASE_URL) regenerates the metadata.
+[env]
+SQLX_OFFLINE = "true"

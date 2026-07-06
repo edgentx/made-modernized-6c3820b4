@@ -5,6 +5,7 @@ members = [
     "crates/game-session",
     "crates/domain",
     "crates/mocks",
+    "crates/persistence",
     "crates/server",
 ]
 
@@ -20,6 +21,7 @@ shared = { path = "crates/shared" }
 game-session = { path = "crates/game-session" }
 domain = { path = "crates/domain" }
 mocks = { path = "crates/mocks" }
+persistence = { path = "crates/persistence" }
 
 # External
 actix-web = "4"
