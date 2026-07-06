@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="MADE">
+  <rect width="512" height="512" rx="96" fill="#0b0d12" />
+  <rect x="96" y="120" width="150" height="272" rx="20" fill="#4c8bf5" transform="rotate(-12 171 256)" />
+  <rect x="266" y="120" width="150" height="272" rx="20" fill="#e7ecf3" transform="rotate(12 341 256)" />
+  <text x="256" y="300" font-family="system-ui, sans-serif" font-size="120" font-weight="700"
+        fill="#0b0d12" text-anchor="middle">M</text>
+</svg>
