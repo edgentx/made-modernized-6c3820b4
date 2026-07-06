@@ -40,6 +40,11 @@
 //! invariant (the disconnect-escalation invariant confirming the existing ledger
 //! is consistent before the schedule advances), and on success emits
 //! [`Event::DisconnectPenaltyApplied`] (`disconnect.penalty.applied`).
+//! [`AwardStar`] (`AwardStarCmd`) grants a star (plus a streak bonus) on a win,
+//! enforcing the same invariants; it emits [`Event::StarAwarded`]
+//! (`star.awarded`) and, when the awarded stars fill the tier, also
+//! promotes the visible rank and emits [`Event::RankPromoted`]
+//! (`rank.promoted`).
 //! This module is hand-written (it no longer uses `shared::stub_aggregate!`) but
 //! preserves the same public surface — a [`RankedStanding`] aggregate and a
 //! [`RankedStandingRepository`] port — so the persistence adapters in
@@ -66,6 +71,10 @@ const APPLY_DISCONNECT_PENALTY: &str = "ApplyDisconnectPenaltyCmd";
 
 /// The `RecordMatchResultCmd` name [`RankedStanding::execute`] recognizes.
 const RECORD_MATCH_RESULT: &str = "RecordMatchResultCmd";
+
+/// The command name [`RankedStanding::execute`] recognizes for granting a star
+/// (plus an optional streak bonus) on a win.
+const AWARD_STAR: &str = "AwardStarCmd";
 
 /// Stars per tier: the visible rank advances through each tier with three stars,
 /// after which the player promotes to the next tier. A live win streak may add
@@ -135,6 +144,18 @@ impl Tier {
     /// rank-floor protection is guaranteed.
     pub fn is_anti_tilt(self) -> bool {
         self.rank() <= Tier::Corner.rank()
+    }
+
+    /// The next tier up the ladder, or `None` at the apex ([`Tier::Legend`]).
+    /// Used to promote a standing when a star fills the current tier.
+    fn next(self) -> Option<Tier> {
+        match self {
+            Tier::Block => Some(Tier::Corner),
+            Tier::Corner => Some(Tier::Contender),
+            Tier::Contender => Some(Tier::Champion),
+            Tier::Champion => Some(Tier::Legend),
+            Tier::Legend => None,
+        }
     }
 
     /// The higher-ranked of two tiers (used to hold the current tier at or above
@@ -223,6 +244,54 @@ impl ApplyRankFloorProtection {
         // Serialization of a plain data struct to a Vec cannot fail here.
         let payload =
             serde_json::to_vec(self).expect("ApplyRankFloorProtection is always serializable");
+        Command::with_payload(Self::COMMAND, payload)
+    }
+}
+
+/// The `AwardStarCmd` payload: the standing to credit, the player it belongs to,
+/// and whether a live win streak grants a bonus star. Field names are the ladder
+/// service's `camelCase` schema.
+///
+/// Build one directly and turn it into a [`Command`] with
+/// [`AwardStar::into_command`], or decode it from a command payload via
+/// [`serde_json`] inside [`RankedStanding::execute`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AwardStar {
+    /// Identity of the standing being credited; must name the standing this
+    /// aggregate records.
+    pub standing_id: String,
+    /// The player this standing belongs to. Must be non-empty and must match the
+    /// standing's own player.
+    pub player_id: String,
+    /// Whether the win extends a streak and so grants an extra *bonus* star on top
+    /// of the base star. Only valid while a win streak is live.
+    pub streak_bonus: bool,
+}
+
+impl AwardStar {
+    /// The command name this maps to.
+    pub const COMMAND: &'static str = AWARD_STAR;
+
+    /// Build a command awarding a star to `standing_id` for `player_id`, granting
+    /// a bonus star when `streak_bonus` is set.
+    pub fn new(
+        standing_id: impl Into<String>,
+        player_id: impl Into<String>,
+        streak_bonus: bool,
+    ) -> Self {
+        Self {
+            standing_id: standing_id.into(),
+            player_id: player_id.into(),
+            streak_bonus,
+        }
+    }
+
+    /// Encode this command as a [`shared::Command`] carrying a JSON payload,
+    /// ready to hand to [`RankedStanding::execute`].
+    pub fn into_command(&self) -> Command {
+        // Serialization of a plain data struct to a Vec cannot fail here.
+        let payload = serde_json::to_vec(self).expect("AwardStar is always serializable");
         Command::with_payload(Self::COMMAND, payload)
     }
 }
@@ -406,6 +475,37 @@ pub struct RankFloorProtected {
     pub tier_floor: Tier,
 }
 
+/// A star (and, when a streak is live, a bonus star) awarded on a win; carried by
+/// [`Event::StarAwarded`] and thus by the emitted `star.awarded` event.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StarAwarded {
+    /// The standing credited with the star(s).
+    pub standing_id: String,
+    /// The player the standing belongs to.
+    pub player_id: String,
+    /// The tier the star was awarded in.
+    pub tier: Tier,
+    /// How many stars this win granted: one, or two with a streak bonus.
+    pub stars_awarded: u8,
+    /// Whether a streak bonus star was included.
+    pub streak_bonus: bool,
+}
+
+/// A promotion to the next tier, triggered when awarded stars fill the current
+/// tier; carried by [`Event::RankPromoted`] and thus by the emitted
+/// `rank.promoted` event.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RankPromoted {
+    /// The standing that was promoted.
+    pub standing_id: String,
+    /// The player the standing belongs to.
+    pub player_id: String,
+    /// The tier the player promoted out of.
+    pub from_tier: Tier,
+    /// The tier the player promoted into.
+    pub to_tier: Tier,
+}
+
 /// The charged penalty, carried by [`Event::DisconnectPenaltyApplied`] and thus
 /// by the emitted `disconnect.penalty.applied` event.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -462,6 +562,10 @@ pub enum Event {
     /// The visible rank was pinned at the reached tier floor: a subsequent loss
     /// cannot demote the player below it.
     RankFloorProtected(RankFloorProtected),
+    /// A star (plus optional streak bonus) was awarded on a win.
+    StarAwarded(StarAwarded),
+    /// Awarded stars filled the tier and the visible rank promoted upward.
+    RankPromoted(RankPromoted),
     /// A suspected smurf was auto-elevated to a higher bracket after reaching the
     /// match threshold.
     SmurfElevated(SmurfElevated),
@@ -477,6 +581,8 @@ impl DomainEvent for Event {
     fn event_type(&self) -> &'static str {
         match self {
             Event::RankFloorProtected(_) => "ranked.rank.floor.protected",
+            Event::StarAwarded(_) => "star.awarded",
+            Event::RankPromoted(_) => "rank.promoted",
             Event::SmurfElevated(_) => "smurf.elevated",
             Event::DisconnectPenaltyApplied(_) => "disconnect.penalty.applied",
             Event::MatchResultRecorded(_) => "match.result.recorded",
@@ -896,6 +1002,97 @@ impl RankedStanding {
         Ok(vec![event])
     }
 
+    /// Handle `AwardStarCmd`: verify the command targets this standing and its
+    /// player, enforce every invariant, then grant a star (plus a streak bonus
+    /// when one is claimed and a streak is live). Emits
+    /// [`Event::StarAwarded`]; when the awarded stars fill the tier
+    /// ([`STARS_PER_TIER`]) the visible rank promotes to the next tier and a
+    /// second [`Event::RankPromoted`] is emitted.
+    fn award_star(&mut self, cmd: AwardStar) -> Result<Vec<Event>, DomainError> {
+        // The command must name the standing this aggregate actually records.
+        if cmd.standing_id != self.id {
+            return Err(DomainError::InvariantViolation(format!(
+                "command targets standing '{}' but this aggregate records '{}'",
+                cmd.standing_id, self.id
+            )));
+        }
+        // A valid, matching player must be supplied.
+        if cmd.player_id.trim().is_empty() {
+            return Err(DomainError::InvariantViolation(format!(
+                "standing '{}' requires a valid playerId to award a star",
+                self.id
+            )));
+        }
+        if cmd.player_id != self.player_id {
+            return Err(DomainError::InvariantViolation(format!(
+                "command names player '{}' but standing '{}' belongs to '{}'",
+                cmd.player_id, self.id, self.player_id
+            )));
+        }
+        // A streak bonus may be claimed only while a win streak is live; awarding
+        // it otherwise would violate the visible-rank (bonus-star) invariant.
+        if cmd.streak_bonus && self.win_streak == 0 {
+            return Err(DomainError::InvariantViolation(format!(
+                "standing '{}' claims a streak bonus star without a live win streak; the bonus \
+                 star is granted only by a win streak",
+                self.id
+            )));
+        }
+
+        // Enforce every invariant against the pre-award state before crediting.
+        self.ensure_ratings_recalculated()?;
+        self.ensure_visible_rank_wellformed()?;
+        self.ensure_floor_protection_valid()?;
+        self.ensure_smurf_elevated()?;
+        self.ensure_disconnect_penalty_escalates()?;
+
+        // One base star, plus a bonus star when the win extends a live streak.
+        let stars_awarded = 1 + u8::from(cmd.streak_bonus);
+        let total = self.stars + stars_awarded;
+
+        let mut events = Vec::new();
+        let awarded = Event::StarAwarded(StarAwarded {
+            standing_id: cmd.standing_id.clone(),
+            player_id: cmd.player_id.clone(),
+            tier: self.tier,
+            stars_awarded,
+            streak_bonus: cmd.streak_bonus,
+        });
+        events.push(awarded);
+
+        // Filling the tier's star cap promotes to the next tier (if one exists),
+        // carrying any surplus stars into it and raising the anti-tilt floor.
+        if total >= STARS_PER_TIER {
+            if let Some(next) = self.tier.next() {
+                let from_tier = self.tier;
+                self.tier = next;
+                self.stars = total - STARS_PER_TIER;
+                self.bonus_star = false;
+                // A newly-reached anti-tilt bracket becomes the protected floor.
+                if next.is_anti_tilt() {
+                    self.tier_floor = self.tier_floor.max_rank(next);
+                }
+                events.push(Event::RankPromoted(RankPromoted {
+                    standing_id: cmd.standing_id,
+                    player_id: cmd.player_id,
+                    from_tier,
+                    to_tier: next,
+                }));
+            } else {
+                // Already at the apex: hold at the star cap, no promotion.
+                self.stars = STARS_PER_TIER;
+            }
+        } else {
+            self.stars = total;
+            self.bonus_star = cmd.streak_bonus;
+        }
+
+        for event in &events {
+            self.root.record(Box::new(event.clone()));
+        }
+        Ok(events)
+    }
+
     /// Handle `ApplyDisconnectPenaltyCmd`: verify the command targets this
     /// standing and its player and carries a prior-penalty count consistent with
     /// the standing's record, enforce every invariant (ratings freshness,
@@ -1150,6 +1347,12 @@ impl Aggregate for RankedStanding {
                         ))
                     })?;
                 self.apply_rank_floor_protection(cmd)
+            }
+            AWARD_STAR => {
+                let cmd: AwardStar = serde_json::from_slice(&command.payload).map_err(|e| {
+                    DomainError::InvariantViolation(format!("malformed AwardStarCmd payload: {e}"))
+                })?;
+                self.award_star(cmd)
             }
             ELEVATE_SMURF => {
                 let cmd: ElevateSmurf = serde_json::from_slice(&command.payload).map_err(|e| {
@@ -2014,5 +2217,224 @@ mod tests {
         assert_eq!(command.name, RecordMatchResult::COMMAND);
         let decoded: RecordMatchResult = serde_json::from_slice(&command.payload).unwrap();
         assert_eq!(decoded, valid_result_cmd());
+    }
+
+    // --- AwardStarCmd ----------------------------------------------------
+
+    /// An award-ready standing `r-01` for player `p-1`, one star short of the tier
+    /// cap so a single awarded star promotes it: fresh Glicko-2 estimate, two
+    /// stars in Corner sitting at its reached Corner floor, no pending smurf
+    /// elevation, and a disconnect ledger on the doubling schedule.
+    fn award_ready_standing() -> RankedStanding {
+        let mut standing = RankedStanding::new("r-01");
+        standing.set_player("p-1");
+        standing.set_ratings(1620.0, 80.0, 0.059, 10, 10);
+        // Two stars in Corner (cap is 3): the next star promotes to Contender.
+        standing.set_visible_rank(Tier::Corner, STARS_PER_TIER - 1, false, 0);
+        standing.set_tier_floor(Tier::Corner);
+        standing.set_smurf_state(10, false, false);
+        standing.set_disconnect_ledger(2, BASE_DISCONNECT_PENALTY * 2);
+        standing
+    }
+
+    /// A command awarding a star (no streak bonus) to `r-01` for player `p-1`.
+    fn award_cmd() -> AwardStar {
+        AwardStar::new("r-01", "p-1", false)
+    }
+
+    // Scenario: Successfully execute AwardStarCmd — a star.awarded event and a
+    // rank.promoted event are both emitted.
+    #[test]
+    fn awards_star_and_promotes_rank_emitting_both_events() {
+        let mut standing = award_ready_standing();
+
+        let events = standing
+            .execute(award_cmd().into_command())
+            .expect("awarding a tier-filling star should succeed");
+
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].event_type(), "star.awarded");
+        assert_eq!(events[1].event_type(), "rank.promoted");
+        match &events[0] {
+            Event::StarAwarded(awarded) => {
+                assert_eq!(awarded.standing_id, "r-01");
+                assert_eq!(awarded.player_id, "p-1");
+                assert_eq!(awarded.tier, Tier::Corner);
+                assert_eq!(awarded.stars_awarded, 1);
+                assert!(!awarded.streak_bonus);
+            }
+            other => panic!("expected StarAwarded, got {other:?}"),
+        }
+        match &events[1] {
+            Event::RankPromoted(promoted) => {
+                assert_eq!(promoted.standing_id, "r-01");
+                assert_eq!(promoted.player_id, "p-1");
+                assert_eq!(promoted.from_tier, Tier::Corner);
+                assert_eq!(promoted.to_tier, Tier::Contender);
+            }
+            other => panic!("expected RankPromoted, got {other:?}"),
+        }
+        // Promoted into Contender with the surplus (0) stars; two events recorded.
+        assert_eq!(standing.tier(), Tier::Contender);
+        assert_eq!(standing.version(), 2);
+        assert_eq!(standing.uncommitted_events().len(), 2);
+    }
+
+    // A win-streak win grants a bonus star on top of the base star.
+    #[test]
+    fn awards_bonus_star_on_a_live_win_streak() {
+        let mut standing = RankedStanding::new("r-01");
+        standing.set_player("p-1");
+        standing.set_ratings(1620.0, 80.0, 0.059, 10, 10);
+        // One star in Corner with a live streak: base + bonus = 2 -> fills the cap.
+        standing.set_visible_rank(Tier::Corner, STARS_PER_TIER - 2, false, 3);
+        standing.set_tier_floor(Tier::Corner);
+        standing.set_smurf_state(10, false, false);
+        standing.set_disconnect_ledger(2, BASE_DISCONNECT_PENALTY * 2);
+
+        let events = standing
+            .execute(AwardStar::new("r-01", "p-1", true).into_command())
+            .expect("a streak win should award a bonus star");
+
+        assert_eq!(events.len(), 2);
+        match &events[0] {
+            Event::StarAwarded(awarded) => {
+                assert_eq!(awarded.stars_awarded, 2);
+                assert!(awarded.streak_bonus);
+            }
+            other => panic!("expected StarAwarded, got {other:?}"),
+        }
+        assert_eq!(standing.tier(), Tier::Contender);
+    }
+
+    // Scenario: rejected — Glicko-2 rating, RD, and volatility are recalculated
+    // after every rated match.
+    #[test]
+    fn award_rejects_when_ratings_are_stale() {
+        let mut standing = award_ready_standing();
+        standing.set_ratings(1620.0, 80.0, 0.059, 10, 9);
+
+        let err = standing
+            .execute(award_cmd().into_command())
+            .expect_err("a stale Glicko-2 estimate must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(standing.version(), 0);
+    }
+
+    // Scenario: rejected — visible rank advances through tiers Block→Legend with
+    // 3 stars per tier; a win streak grants a bonus star.
+    #[test]
+    fn award_rejects_when_visible_rank_exceeds_stars_per_tier() {
+        let mut standing = award_ready_standing();
+        standing.set_visible_rank(Tier::Corner, STARS_PER_TIER + 1, false, 0);
+
+        let err = standing
+            .execute(award_cmd().into_command())
+            .expect_err("a tier over its star cap must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(standing.version(), 0);
+    }
+
+    // Visible-rank invariant: a streak bonus star cannot be claimed without a live
+    // win streak.
+    #[test]
+    fn award_rejects_streak_bonus_without_a_win_streak() {
+        let mut standing = award_ready_standing();
+
+        let err = standing
+            .execute(AwardStar::new("r-01", "p-1", true).into_command())
+            .expect_err("a streak bonus without a streak must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(standing.version(), 0);
+    }
+
+    // Scenario: rejected — rank-floor protection prevents demotion below a
+    // reached tier floor (anti-tilt applies to Block/Corner).
+    #[test]
+    fn award_rejects_when_standing_is_below_its_floor() {
+        let mut standing = award_ready_standing();
+        // Current tier Block sits below the reached Corner floor.
+        standing.set_visible_rank(Tier::Block, 2, false, 0);
+
+        let err = standing
+            .execute(award_cmd().into_command())
+            .expect_err("a standing below its floor must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(standing.version(), 0);
+    }
+
+    // Scenario: rejected — a suspected smurf is auto-elevated to a higher bracket
+    // after 20 matches.
+    #[test]
+    fn award_rejects_suspected_smurf_not_yet_elevated() {
+        let mut standing = award_ready_standing();
+        standing.set_smurf_state(SMURF_ELEVATION_MATCHES, true, false);
+
+        let err = standing
+            .execute(award_cmd().into_command())
+            .expect_err("an un-elevated suspected smurf must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(standing.version(), 0);
+    }
+
+    // Scenario: rejected — disconnect penalties escalate (doubling) on repeated
+    // abandonment.
+    #[test]
+    fn award_rejects_when_disconnect_penalty_does_not_double() {
+        let mut standing = award_ready_standing();
+        standing.set_disconnect_ledger(3, BASE_DISCONNECT_PENALTY * 3);
+
+        let err = standing
+            .execute(award_cmd().into_command())
+            .expect_err("a penalty off the doubling schedule must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(standing.version(), 0);
+    }
+
+    // A command naming a different standing or player is rejected before crediting.
+    #[test]
+    fn award_rejects_command_for_a_different_standing_or_player() {
+        let mut standing = award_ready_standing();
+        let wrong_standing = standing
+            .execute(AwardStar::new("r-99", "p-1", false).into_command())
+            .expect_err("a command for another standing must be rejected");
+        assert!(matches!(wrong_standing, DomainError::InvariantViolation(_)));
+
+        let wrong_player = standing
+            .execute(AwardStar::new("r-01", "p-other", false).into_command())
+            .expect_err("a command for another player must be rejected");
+        assert!(matches!(wrong_player, DomainError::InvariantViolation(_)));
+
+        let no_player = standing
+            .execute(AwardStar::new("r-01", "   ", false).into_command())
+            .expect_err("a missing playerId must be rejected");
+        assert!(matches!(no_player, DomainError::InvariantViolation(_)));
+        assert_eq!(standing.version(), 0);
+    }
+
+    // A mid-tier win that does not fill the cap awards a star without promoting.
+    #[test]
+    fn award_without_filling_tier_emits_only_star_awarded() {
+        let mut standing = award_ready_standing();
+        // One star in Corner: awarding one more reaches two, below the cap of 3.
+        standing.set_visible_rank(Tier::Corner, STARS_PER_TIER - 2, false, 0);
+
+        let events = standing
+            .execute(award_cmd().into_command())
+            .expect("awarding a non-filling star should succeed");
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_type(), "star.awarded");
+        assert_eq!(standing.tier(), Tier::Corner);
+        assert_eq!(standing.version(), 1);
+    }
+
+    #[test]
+    fn award_command_payload_round_trips() {
+        let cmd = AwardStar::new("r-01", "p-1", true);
+        let command = cmd.into_command();
+        assert_eq!(command.name, AwardStar::COMMAND);
+        let decoded: AwardStar = serde_json::from_slice(&command.payload).unwrap();
+        assert_eq!(decoded, cmd);
     }
 }
