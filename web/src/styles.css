@@ -1464,3 +1464,27 @@ body {
   color: var(--magenta); align-self: flex-start;
 }
 .boss__tagline { font-size: 0.72rem; color: var(--muted); line-height: 1.35; }
+
+/* ── Rules / How-to-Play ───────────────────────────────────────────────────── */
+.rules { padding: 1.5rem 2.5rem; }
+.rules__head { margin-bottom: 1.25rem; }
+.rules__title {
+  font-family: var(--font-display); font-size: 1.6rem; color: var(--accent);
+  text-shadow: 0 0 12px rgba(80,220,255,0.4); margin: 0;
+}
+.rules__sub { font-family: var(--font-mono); font-size: 0.82rem; color: var(--amber); margin: 0.25rem 0 0; }
+.rules__grid {
+  display: grid; gap: 1rem; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); align-items: start;
+}
+.rules__card {
+  background: linear-gradient(180deg, rgba(20,26,44,0.85), rgba(8,11,22,0.95));
+  border: 1px solid var(--line-hot, #2a3350); border-radius: 6px; padding: 1rem 1.1rem;
+}
+.rules__card-title {
+  font-family: var(--font-display); font-size: 1.05rem; color: var(--magenta); margin: 0 0 0.35rem;
+}
+.rules__blurb { font-size: 0.82rem; color: var(--text); line-height: 1.45; margin: 0 0 0.7rem; }
+.rules__list { margin: 0; }
+.rules__row { display: grid; grid-template-columns: minmax(90px, 34%) 1fr; gap: 0.5rem; padding: 0.3rem 0; border-top: 1px solid rgba(255,255,255,0.05); }
+.rules__term { font-family: var(--font-mono); font-size: 0.68rem; text-transform: uppercase; letter-spacing: 0.04em; color: var(--accent); }
+.rules__def { font-size: 0.74rem; color: var(--muted); line-height: 1.4; margin: 0; }

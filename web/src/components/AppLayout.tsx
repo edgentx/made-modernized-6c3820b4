@@ -13,6 +13,7 @@ const coreNav: NavItem[] = [
   { to: '/leaderboard', label: 'Ranks' },
   { to: '/story', label: 'Story' },
   { to: '/bosses', label: 'Bosses' },
+  { to: '/rules', label: 'Rules' },
 ]
 
 // Capability-gated nav. Each entry is guarded by an inlined build flag, so the

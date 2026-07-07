@@ -10,6 +10,7 @@ import ShopView from './views/ShopView'
 import LeaderboardView from './views/LeaderboardView'
 import StoryView from './views/StoryView'
 import HeroesView from './views/HeroesView'
+import RulesView from './views/RulesView'
 import NotFoundView from './views/NotFoundView'
 
 // Capability-gated routes. The `__CAP_*__` guards are literal booleans injected
@@ -57,6 +58,7 @@ export const routes: RouteObject[] = [
           { path: 'leaderboard', element: <LeaderboardView /> },
           { path: 'story', element: <StoryView /> },
           { path: 'bosses', element: <HeroesView /> },
+          { path: 'rules', element: <RulesView /> },
           ...gatedRoutes,
           { path: '*', element: <NotFoundView /> },
         ],

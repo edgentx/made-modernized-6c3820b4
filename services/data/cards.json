@@ -1129,11 +1129,14 @@
    "cardType": "Operator",
    "cardClass": "Police",
    "rarity": "common",
-   "keywords": [],
+   "keywords": [
+    "Stealth",
+    "Wildcard"
+   ],
    "effectScriptRef": "",
    "copyCap": 2,
    "art": "/assets/cards/pd_k9_unit.webp",
-   "text": "2/2. Stealth. Drive-By 1 when it drops.",
+   "text": "2/2. Stealth. Wildcard: when it attacks, 30% chance to trigger Accidental Bite.",
    "heat": 0,
    "atk": 2,
    "hp": 2,
@@ -1338,6 +1341,146 @@
    "copyCap": 2,
    "art": "/assets/cards/pd_raid.webp",
    "text": "Deal 3 damage split among all enemy Operators. +2 Heat.",
+   "heat": 0,
+   "atk": null,
+   "hp": null,
+   "artTint": 0
+  },
+  {
+   "cardId": "pd_flashbang",
+   "name": "Flashbang",
+   "cost": 4,
+   "cardType": "Job",
+   "cardClass": "Police",
+   "rarity": "rare",
+   "keywords": [],
+   "effectScriptRef": "",
+   "copyCap": 2,
+   "art": "/assets/cards/pd_flashbang.webp",
+   "text": "Stun ALL enemy Operators — they can't attack or block next turn. +1 Heat.",
+   "heat": 1,
+   "atk": null,
+   "hp": null,
+   "artTint": 0
+  },
+  {
+   "cardId": "pd_dookie",
+   "name": "Dookie in the Vehicle",
+   "cost": 1,
+   "cardType": "Job",
+   "cardClass": "Police",
+   "rarity": "common",
+   "keywords": [
+    "Wildcard"
+   ],
+   "effectScriptRef": "",
+   "copyCap": 2,
+   "art": "/assets/cards/pd_dookie.webp",
+   "text": "Street Event (Wildcard) — rolls off a Vehicle play. A random friendly Vehicle loses 1 ATK this turn. Draw a card.",
+   "heat": 0,
+   "atk": null,
+   "hp": null,
+   "artTint": 0
+  },
+  {
+   "cardId": "pd_accidental_bite",
+   "name": "Accidental Bite",
+   "cost": 1,
+   "cardType": "Job",
+   "cardClass": "Police",
+   "rarity": "common",
+   "keywords": [
+    "Wildcard"
+   ],
+   "effectScriptRef": "",
+   "copyCap": 2,
+   "art": "/assets/cards/pd_accidental_bite.webp",
+   "text": "Street Event (Wildcard) — rolls off a K-9 play. Deal 2 damage to a RANDOM Operator, friend or foe.",
+   "heat": 0,
+   "atk": null,
+   "hp": null,
+   "artTint": 0
+  },
+  {
+   "cardId": "ht_hot_streak",
+   "name": "Hot Streak",
+   "cost": 2,
+   "cardType": "Operation",
+   "cardClass": "Neutral",
+   "rarity": "rare",
+   "keywords": [],
+   "effectScriptRef": "",
+   "copyCap": 2,
+   "art": "/assets/cards/ht_hot_streak.webp",
+   "text": "Your Vehicles cost 1 less. Heat Trail: whenever you play a Vehicle, gain +1 Heat.",
+   "heat": 0,
+   "atk": null,
+   "hp": null,
+   "artTint": 0
+  },
+  {
+   "cardId": "ht_loose_ends",
+   "name": "Loose Ends",
+   "cost": 2,
+   "cardType": "Job",
+   "cardClass": "Neutral",
+   "rarity": "uncommon",
+   "keywords": [],
+   "effectScriptRef": "",
+   "copyCap": 2,
+   "art": "/assets/cards/ht_loose_ends.webp",
+   "text": "Draw 2. For the rest of the game, whenever you draw a Heist, gain 1 Heat.",
+   "heat": 0,
+   "atk": null,
+   "hp": null,
+   "artTint": 0
+  },
+  {
+   "cardId": "ht_the_come_up",
+   "name": "The Come-Up",
+   "cost": 3,
+   "cardType": "Operation",
+   "cardClass": "Homestead",
+   "rarity": "epic",
+   "keywords": [],
+   "effectScriptRef": "",
+   "copyCap": 2,
+   "art": "/assets/cards/ht_the_come_up.webp",
+   "text": "At the start of your turn: +1 Juice AND +1 Heat.",
+   "heat": 0,
+   "atk": null,
+   "hp": null,
+   "artTint": 0
+  },
+  {
+   "cardId": "ht_going_loud",
+   "name": "Going Loud",
+   "cost": 3,
+   "cardType": "Job",
+   "cardClass": "Cain",
+   "rarity": "rare",
+   "keywords": [],
+   "effectScriptRef": "",
+   "copyCap": 2,
+   "art": "/assets/cards/ht_going_loud.webp",
+   "text": "This turn, each Job you play after this gains +1 Heat. Deal damage to any target equal to Heat gained this turn.",
+   "heat": 0,
+   "atk": null,
+   "hp": null,
+   "artTint": 0
+  },
+  {
+   "cardId": "ht_word_on_street",
+   "name": "Word on the Street",
+   "cost": 3,
+   "cardType": "Operation",
+   "cardClass": "Vega",
+   "rarity": "rare",
+   "keywords": [],
+   "effectScriptRef": "",
+   "copyCap": 2,
+   "art": "/assets/cards/ht_word_on_street.webp",
+   "text": "Heat Trail: whenever you play an Operator, gain +1 Heat and draw a card.",
    "heat": 0,
    "atk": null,
    "hp": null,
@@ -1649,6 +1792,46 @@
    },
    {
     "cardId": "pd_raid",
+    "quantity": 2,
+    "cosmeticSkinRef": null
+   },
+   {
+    "cardId": "pd_flashbang",
+    "quantity": 2,
+    "cosmeticSkinRef": null
+   },
+   {
+    "cardId": "pd_dookie",
+    "quantity": 2,
+    "cosmeticSkinRef": null
+   },
+   {
+    "cardId": "pd_accidental_bite",
+    "quantity": 2,
+    "cosmeticSkinRef": null
+   },
+   {
+    "cardId": "ht_hot_streak",
+    "quantity": 2,
+    "cosmeticSkinRef": null
+   },
+   {
+    "cardId": "ht_loose_ends",
+    "quantity": 2,
+    "cosmeticSkinRef": null
+   },
+   {
+    "cardId": "ht_the_come_up",
+    "quantity": 2,
+    "cosmeticSkinRef": null
+   },
+   {
+    "cardId": "ht_going_loud",
+    "quantity": 2,
+    "cosmeticSkinRef": null
+   },
+   {
+    "cardId": "ht_word_on_street",
     "quantity": 2,
     "cosmeticSkinRef": null
    }
