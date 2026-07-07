@@ -26,6 +26,7 @@ export default function MatchView() {
   const { state } = match
   const yourTurn = state.turn === match.selfSeat && state.phase === 'active'
   const over = state.phase === 'completed'
+  const you = state.seats[match.selfSeat]
 
   return (
     <section className="match" aria-labelledby="match-title">
@@ -68,12 +69,45 @@ export default function MatchView() {
         ) : null}
       </div>
 
+      {/* Your operators — click a ready one to send it at the enemy boss. */}
+      <div className="match__board" aria-label="Your operators">
+        {you.board.map((u) => (
+          <button
+            key={u.instanceId}
+            type="button"
+            className={u.ready ? 'op op--ready' : 'op'}
+            disabled={!yourTurn || !u.ready}
+            title={u.ready ? `Attack for ${u.atk}` : 'Summoning sickness'}
+            onClick={() => match.attack(u.instanceId)}
+          >
+            <span className="op__name">{u.name}</span>
+            <span className="op__stats">{u.atk}/{u.hp}</span>
+          </button>
+        ))}
+        {you.board.length === 0 ? <span className="match__hint">No Operators in play yet</span> : null}
+      </div>
+
+      {/* Your hand — click a card you can afford to play it. */}
+      <div className="match__hand" aria-label="Your hand">
+        {you.hand.map((c) => (
+          <button
+            key={c.instanceId}
+            type="button"
+            className="handcard"
+            disabled={!yourTurn || c.cost > you.juice || over}
+            onClick={() => match.playCard(c.instanceId)}
+          >
+            <span className="handcard__cost">{c.cost}</span>
+            <span className="handcard__name">{c.name}</span>
+            <span className="handcard__text">{cardText(c)}</span>
+          </button>
+        ))}
+        {you.hand.length === 0 ? <span className="match__hint">Hand empty — end your turn to draw</span> : null}
+      </div>
+
       <footer className="match__actions">
-        <button type="button" className="match__action" disabled={!yourTurn} onClick={match.playCard}>
-          Play card
-        </button>
         <button type="button" className="match__action" disabled={!yourTurn} onClick={match.heroPower}>
-          Hero power
+          Boss Power (2 → face)
         </button>
         <button type="button" className="match__action" disabled={!yourTurn} onClick={match.endTurn}>
           End turn
@@ -90,6 +124,18 @@ export default function MatchView() {
       </footer>
     </section>
   )
+}
+
+/** One-line summary of what a hand card does, from its effect. */
+function cardText(c: { effect: string; amount: number; atk?: number; hp?: number }): string {
+  switch (c.effect) {
+    case 'damage': return `Deal ${c.amount} to the boss`
+    case 'summon': return `Operator ${c.atk ?? 1}/${c.hp ?? 1}`
+    case 'draw': return `Draw ${c.amount}`
+    case 'juice': return `+${c.amount} Juice`
+    case 'cool': return `Lower Heat ${c.amount}`
+    default: return ''
+  }
 }
 
 /** Human-readable connection status, annotated with any in-flight predictions. */

@@ -2,65 +2,107 @@
  * Local rules-engine tests.
  *
  * These pin the invariants the browser mirrors from `crates/game-session`:
- * turn ownership, Juice affordability, the Heat cap, and that both an optimistic
- * prediction and an authoritative delta fold through the same event path. They
- * are plain TS against pure functions (no DOM), matching the API client tests.
+ * turn ownership, Juice affordability, the Heat cap / Cop Event, card effects
+ * (damage / summon / attack / win), and that a prediction and an authoritative
+ * delta fold through the same event path. Plain TS against pure functions.
  */
 import { describe, expect, it } from 'vitest'
-import { applyAction, foldEvent, startMatch, validateAction } from './rules'
-import { JUICE_CAP, type MatchAction } from './model'
+import { aiTurn, applyAction, foldEvent, startMatch, validateAction } from './rules'
+import { JUICE_CAP, opponent, type HandCard, type MatchAction, type MatchState, type Seat } from './model'
 
-const play = (seat: 'A' | 'B', juiceCost: number): MatchAction => ({
-  kind: 'PlayCardCmd',
-  seat,
-  cardInstanceId: 'card-1',
-  targetRef: 'boss:B',
-  juiceCost,
+const card = (over: Partial<HandCard>): HandCard => ({
+  cardId: 'bolt', name: 'Bolt', cost: 1, type: 'Job', effect: 'damage', amount: 3, instanceId: 'inst-1', ...over,
+})
+/** Give `seat` a controlled hand + plenty of Juice for deterministic tests. */
+const withHand = (s: MatchState, seat: Seat, hand: HandCard[], juice = 10): MatchState => ({
+  ...s,
+  seats: { ...s.seats, [seat]: { ...s.seats[seat], hand, juice } },
+})
+const playOf = (seat: Seat, c: HandCard): MatchAction => ({
+  kind: 'PlayCardCmd', seat, cardInstanceId: c.instanceId, targetRef: `boss:${opponent(seat)}`, juiceCost: c.cost,
 })
 
 describe('validateAction', () => {
   it('accepts a legal play by the turn-holder', () => {
-    const s = startMatch('m')
-    expect(validateAction(s, play('A', 1)).ok).toBe(true)
+    const c = card({ instanceId: 'a1' })
+    const s = withHand(startMatch('m'), 'A', [c])
+    expect(validateAction(s, playOf('A', c)).ok).toBe(true)
   })
 
   it('rejects an action from the seat that does not hold the turn', () => {
-    const s = startMatch('m') // A to move
-    const decision = validateAction(s, play('B', 1))
-    expect(decision).toEqual({ ok: false, reason: 'it is not your turn' })
+    const c = card({ instanceId: 'b1' })
+    const s = withHand(startMatch('m'), 'B', [c])
+    expect(validateAction(s, playOf('B', c))).toEqual({ ok: false, reason: 'it is not your turn' })
   })
 
   it('rejects a play the seat cannot afford', () => {
-    const s = startMatch('m') // A opens with availableJuice 3
-    const decision = validateAction(s, play('A', 4))
-    expect(decision.ok).toBe(false)
+    const c = card({ instanceId: 'a1', cost: 6 })
+    const s = withHand(startMatch('m'), 'A', [c], 3)
+    expect(validateAction(s, playOf('A', c)).ok).toBe(false)
   })
 
   it('allows concede off-turn (the one exemption from the turn rule)', () => {
-    const s = startMatch('m') // A to move
-    expect(validateAction(s, { kind: 'ConcedeMatchCmd', seat: 'B' }).ok).toBe(true)
+    expect(validateAction(startMatch('m'), { kind: 'ConcedeMatchCmd', seat: 'B' }).ok).toBe(true)
   })
 
   it('rejects any action once the match is completed', () => {
-    const s = { ...startMatch('m'), phase: 'completed' as const }
-    expect(validateAction(s, play('A', 1)).ok).toBe(false)
+    const c = card({ instanceId: 'a1' })
+    const s = { ...withHand(startMatch('m'), 'A', [c]), phase: 'completed' as const }
+    expect(validateAction(s, playOf('A', c)).ok).toBe(false)
   })
 })
 
 describe('applyAction', () => {
-  it('spends Juice and raises Heat when a card is played', () => {
-    const s0 = startMatch('m')
-    const { state, events } = applyAction(s0, play('A', 2))
-    expect(events.map((e) => e.type)).toEqual(['card.played', 'heat.raised'])
-    expect(state.seats.A.juice).toBe(1) // 3 - 2
-    expect(state.seats.A.heat).toBe(1) // +HEAT_PER_PLAY
+  it('spends Juice, raises Heat, removes the card, and damages the enemy boss', () => {
+    const c = card({ instanceId: 'a1', cost: 2, effect: 'damage', amount: 3 })
+    const s0 = withHand(startMatch('m'), 'A', [c])
+    const { state, events } = applyAction(s0, playOf('A', c))
+    expect(events.map((e) => e.type)).toEqual(['card.played', 'heat.raised', 'boss.damaged'])
+    expect(state.seats.A.juice).toBe(8) // 10 - 2
+    expect(state.seats.A.heat).toBe(1)
+    expect(state.seats.A.hand).toHaveLength(0)
+    expect(state.seats.B.bossHp).toBe(27) // 30 - 3
   })
 
-  it('passes the turn and ramps the incoming seat, capped at JUICE_CAP', () => {
+  it('summons an Operator that can attack from the next turn', () => {
+    const c = card({ instanceId: 'a1', cost: 1, effect: 'summon', amount: 0, atk: 4, hp: 3 })
+    const s = applyAction(withHand(startMatch('m'), 'A', [c]), playOf('A', c)).state
+    expect(s.seats.A.board).toHaveLength(1)
+    expect(s.seats.A.board[0].ready).toBe(false) // summoning sickness
+  })
+
+  it('an Operator attack lowers the enemy boss and exhausts the attacker', () => {
+    const c = card({ instanceId: 'a1', cost: 1, effect: 'summon', amount: 0, atk: 5, hp: 5 })
+    let s = applyAction(withHand(startMatch('m'), 'A', [c]), playOf('A', c)).state
+    s = { ...s, seats: { ...s.seats, A: { ...s.seats.A, board: s.seats.A.board.map((u) => ({ ...u, ready: true })) } } }
+    const { state } = applyAction(s, { kind: 'AttackCmd', seat: 'A', attackerId: 'a1' })
+    expect(state.seats.B.bossHp).toBe(25) // 30 - 5
+    expect(state.seats.A.board[0].ready).toBe(false)
+  })
+
+  it('completes the match when a boss reaches 0', () => {
+    const c = card({ instanceId: 'a1', cost: 5, effect: 'damage', amount: 7 })
+    const s0 = withHand({ ...startMatch('m'), seats: { ...startMatch('m').seats, B: { ...startMatch('m').seats.B, bossHp: 5 } } }, 'A', [c])
+    const { state } = applyAction(s0, playOf('A', c))
+    expect(state.phase).toBe('completed')
+    expect(state.winner).toBe('A')
+  })
+
+  it('fires a Cop Event that cools Heat and raids the hottest player', () => {
+    const c = card({ instanceId: 'a1', cost: 1, effect: 'damage', amount: 1 })
+    const s0 = withHand({ ...startMatch('m'), seats: { ...startMatch('m').seats, A: { ...startMatch('m').seats.A, heat: 9 } } }, 'A', [c])
+    const { state, events } = applyAction(s0, playOf('A', c))
+    expect(events.some((e) => e.type === 'cop.raided')).toBe(true)
+    expect(state.seats.A.heat).toBe(3) // reset
+    expect(state.seats.A.bossHp).toBe(27) // 30 - 3 cop damage
+  })
+
+  it('passes the turn, readies operators, draws, and ramps (capped)', () => {
     const s0 = { ...startMatch('m'), seats: { ...startMatch('m').seats, B: { ...startMatch('m').seats.B, juice: JUICE_CAP } } }
     const { state } = applyAction(s0, { kind: 'EndTurnCmd', seat: 'A' })
     expect(state.turn).toBe('B')
-    expect(state.seats.B.juice).toBe(JUICE_CAP) // already capped, does not overflow
+    expect(state.seats.B.juice).toBe(JUICE_CAP) // already capped, no overflow
+    expect(state.seats.B.hand.length).toBe(5) // 4 opening + 1 drawn
   })
 
   it('completes the match with the opponent as winner on concede', () => {
@@ -71,14 +113,22 @@ describe('applyAction', () => {
   })
 
   it('throws when asked to apply an illegal action', () => {
-    expect(() => applyAction(startMatch('m'), play('B', 1))).toThrow()
+    expect(() => applyAction(startMatch('m'), playOf('B', card({ instanceId: 'x' })))).toThrow()
+  })
+})
+
+describe('aiTurn', () => {
+  it('takes a full turn and passes back to the opponent', () => {
+    const s0 = { ...startMatch('m'), turn: 'B' as const }
+    const { state } = aiTurn(s0, 'B')
+    // Either it ended its turn (turn back to A) or it won outright.
+    expect(state.turn === 'A' || state.phase === 'completed').toBe(true)
   })
 })
 
 describe('foldEvent', () => {
   it('folds an authoritative turn.ended delta identically to a prediction', () => {
-    const s0 = startMatch('m')
-    const folded = foldEvent(s0, { type: 'turn.ended', player: 'A', nextPlayer: 'B', nextPlayerJuice: 4 })
+    const folded = foldEvent(startMatch('m'), { type: 'turn.ended', player: 'A', nextPlayer: 'B', nextPlayerJuice: 4 })
     expect(folded.turn).toBe('B')
     expect(folded.seats.B.juice).toBe(4)
   })
