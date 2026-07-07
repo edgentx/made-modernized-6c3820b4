@@ -67,6 +67,13 @@ export default function MatchView() {
             </button>
           </div>
         ) : null}
+        {over ? (
+          <div className={`match__result match__result--${state.winner === match.selfSeat ? 'win' : 'loss'}`} role="status">
+            <span className="match__result-title">{state.winner === match.selfSeat ? 'You run this block.' : 'Busted.'}</span>
+            <span className="match__result-sub">{state.winner === match.selfSeat ? 'Victory' : 'Defeat'}</span>
+            <button type="button" className="match__action match__action--primary" onClick={match.newMatch}>New match</button>
+          </div>
+        ) : null}
       </div>
 
       {/* Your operators — click a ready one to send it at the enemy boss. */}
@@ -97,6 +104,7 @@ export default function MatchView() {
             disabled={!yourTurn || c.cost > you.juice || over}
             onClick={() => match.playCard(c.instanceId)}
           >
+            <span className="handcard__art" style={{ backgroundImage: `url(/assets/cards/${c.cardId}.webp)` }} aria-hidden="true" />
             <span className="handcard__cost">{c.cost}</span>
             <span className="handcard__name">{c.name}</span>
             <span className="handcard__text">{cardText(c)}</span>
