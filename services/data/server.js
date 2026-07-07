@@ -55,7 +55,7 @@ const SHOP_ITEMS = [
 
 // ── Schema: queries (searchable) + subscriptions (push) ───────────────────────
 const typeDefs = /* GraphQL */ `
-  type Card { cardId: ID!, name: String!, cost: Int!, cardClass: String!, cardType: String!, rarity: String!, keywords: [String!]!, effectScriptRef: String!, copyCap: Int!, art: String, text: String, heat: Int, atk: Int, hp: Int }
+  type Card { cardId: ID!, name: String!, cost: Int!, cardClass: String!, cardType: String!, rarity: String!, keywords: [String!]!, effectScriptRef: String!, copyCap: Int!, art: String, text: String, heat: Int, atk: Int, hp: Int, artTint: Int }
   type OwnedCard { cardId: ID!, quantity: Int!, cosmeticSkinRef: String }
   type Deck { deckId: ID!, name: String!, cardIds: [String!]!, active: Boolean! }
   type Collection { playerId: ID!, ownedCards: [OwnedCard!]!, decks: [Deck!]! }

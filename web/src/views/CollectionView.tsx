@@ -102,7 +102,7 @@ export default function CollectionView() {
                     <span
                       className="deck__art"
                       aria-hidden="true"
-                      style={row.card.art ? { backgroundImage: `url(${row.card.art})` } : undefined}
+                      style={row.card.art ? { backgroundImage: `url(${row.card.art})`, filter: row.card.artTint ? `hue-rotate(${row.card.artTint}deg)` : undefined } : undefined}
                     >
                       {!row.card.art ? row.card.name.charAt(0) : null}
                     </span>
