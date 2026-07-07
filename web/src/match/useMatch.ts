@@ -61,8 +61,11 @@ export function useMatch(matchId = 'live', ticket?: string): MatchController {
   const canvasRef = useRef<HTMLCanvasElement>(null)
   const rendererRef = useRef<BoardRenderer | null>(null)
 
-  const [mode, setModeState] = useState<MatchMode>('online')
-  const [status, setStatus] = useState<ConnectionStatus | 'practice'>('connecting')
+  // Default to Practice: the local rules WASM is a self-contained authority, so
+  // the board is immediately playable with no server. Online attaches the
+  // authoritative socket when a backend is available.
+  const [mode, setModeState] = useState<MatchMode>('practice')
+  const [status, setStatus] = useState<ConnectionStatus | 'practice'>('practice')
   const [correction, setCorrection] = useState<string | null>(null)
   // Bumped whenever the board changes, to re-render the React chrome (the canvas
   // itself redraws on its own rAF loop from refs).
