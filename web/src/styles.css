@@ -1,9 +1,29 @@
+@import url('https://fonts.googleapis.com/css2?family=Bebas+Neue&family=Chakra+Petch:wght@500;600;700&family=Inter:wght@400;600;800&family=JetBrains+Mono:wght@400;600&display=swap');
+
 :root {
-  --bg: #0b0d12;
-  --surface: #151a23;
-  --text: #e7ecf3;
-  --muted: #8b97a8;
-  --accent: #4c8bf5;
+  /* MADE cyberpunk theme — ported from the made-site design reference:
+     cyan/magenta/amber neon on near-black, synthwave-grid mood. */
+  --bg: #04050a;
+  --bg-deep: #070912;
+  --surface: #12172a;
+  --surface-glass: rgba(18, 23, 42, 0.55);
+  --text: #e6f1ff;
+  --muted: #8493b4;
+  --faint: #4c5878;
+  --line: #1d2438;
+  --line-hot: rgba(0, 229, 255, 0.28);
+  --accent: #00e5ff;
+  --accent-glow: #6ef6ff;
+  --magenta: #ff2d8e;
+  --amber: #ffb01f;
+  --purple: #b14aff;
+  --font-display: 'Bebas Neue', 'Impact', sans-serif;
+  --font-tech: 'Chakra Petch', 'Bebas Neue', sans-serif;
+  --font-body: 'Inter', system-ui, sans-serif;
+  --font-mono: 'JetBrains Mono', 'Menlo', monospace;
+  --glow-cyan: 0 0 18px rgba(0, 229, 255, 0.45);
+  --glow-magenta: 0 0 18px rgba(255, 45, 142, 0.45);
+  --glow-amber: 0 0 18px rgba(255, 176, 31, 0.4);
   color-scheme: dark;
 }
 
@@ -19,9 +39,15 @@ body,
 }
 
 body {
-  background: var(--bg);
   color: var(--text);
-  font-family: system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
+  font-family: var(--font-body);
+  /* Synthwave ground: deep radial neon wash over a faint scanline grid. */
+  background-color: var(--bg);
+  background-image:
+    radial-gradient(1200px 600px at 50% -10%, rgba(0, 229, 255, 0.08), transparent 60%),
+    radial-gradient(900px 500px at 100% 110%, rgba(255, 45, 142, 0.07), transparent 60%),
+    linear-gradient(to bottom, transparent 0 2px, rgba(0, 229, 255, 0.035) 2px 4px);
+  background-attachment: fixed;
   /* Respect device safe areas (notches) in a native/standalone shell. */
   padding: env(safe-area-inset-top) env(safe-area-inset-right)
     env(safe-area-inset-bottom) env(safe-area-inset-left);
@@ -919,4 +945,150 @@ body {
   .story__grid {
     grid-template-columns: repeat(auto-fill, minmax(16rem, 1fr));
   }
+}
+
+/* ============================================================================
+   MADE cyberpunk theme layer — ported from the made-site design reference.
+   Applies the neon aesthetic on top of the existing BEM layout: display-font
+   headings with cyan glow, tech-font neon nav, glowing controls, glass cards,
+   scanline chrome. Kept as an append-only override so layout rules are intact.
+   ============================================================================ */
+
+/* Titles: condensed display face, uppercase, cyan neon with a magenta offset. */
+.view__title,
+.login__title,
+.shop__title,
+.deck__title,
+.ranks__title,
+.story__title,
+.match__title {
+  font-family: var(--font-display);
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--text);
+  text-shadow: 0 0 22px rgba(0, 229, 255, 0.35), 2px 2px 0 rgba(255, 45, 142, 0.55);
+}
+
+/* Section/sub headings + labels in the tech face. */
+.shop__section-title,
+.deck__pane-title,
+.shop__card-name,
+.deck__field-label,
+.story__boss-label,
+.app__nav-link {
+  font-family: var(--font-tech);
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+/* Numbers / costs / meta in mono. */
+.deck__cost,
+.deck__count,
+.shop__price,
+.deck__count-badge,
+.deck__meta,
+.match__action {
+  font-family: var(--font-mono);
+}
+
+/* Bottom nav: glass bar, hot cyan top line, glowing active tab. */
+.app__nav {
+  background: var(--surface-glass);
+  backdrop-filter: blur(8px);
+  border-top: 1px solid var(--line-hot);
+}
+.app__nav-link {
+  color: var(--muted);
+  border: 1px solid transparent;
+}
+.app__nav-link--active {
+  color: var(--accent);
+  background: linear-gradient(180deg, rgba(0, 229, 255, 0.16), rgba(0, 229, 255, 0.04));
+  border: 1px solid var(--line-hot);
+  box-shadow: var(--glow-cyan);
+  text-shadow: 0 0 10px rgba(0, 229, 255, 0.6);
+}
+
+/* Primary actions: neon cyan slab with glow; hover ramps the glow. */
+.deck__btn--primary,
+.shop__btn,
+.ranks__btn,
+.story__btn,
+.login__cta {
+  font-family: var(--font-tech);
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  color: #04141a;
+  background: linear-gradient(135deg, var(--accent), var(--accent-glow));
+  border: 1px solid var(--accent);
+  border-radius: 0.5rem;
+  box-shadow: var(--glow-cyan);
+  transition: box-shadow 0.15s ease, transform 0.05s ease;
+}
+/* Secondary text link ("use a different account"): keep it quiet, cyan tint. */
+.login__link {
+  color: var(--accent);
+  text-decoration-color: var(--line-hot);
+}
+.deck__btn--primary:hover,
+.shop__btn:hover,
+.ranks__btn:hover,
+.story__btn:hover,
+.login__cta:hover {
+  box-shadow: 0 0 26px rgba(0, 229, 255, 0.7);
+}
+.deck__btn--primary:active,
+.shop__btn:active,
+.ranks__btn:active,
+.story__btn:active {
+  transform: translateY(1px);
+}
+
+/* Cards / panels: dark glass with a hot cyan edge + depth glow. */
+.shop__card,
+.deck__pane,
+.deck__saved,
+.story,
+.ranks {
+  background: var(--surface-glass);
+  border: 1px solid var(--line);
+  border-radius: 0.75rem;
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.6), inset 0 0 0 1px rgba(0, 229, 255, 0.06);
+}
+.shop__card:hover {
+  border-color: var(--line-hot);
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.6), var(--glow-cyan);
+}
+
+/* Legendary / rarity accents pick up magenta + amber neon. */
+.deck__tag--legendary {
+  color: var(--amber);
+  text-shadow: var(--glow-amber);
+  border-color: var(--amber);
+}
+
+/* Errors in crit-magenta. */
+.deck__error,
+.shop__error,
+.story__error,
+.login__error {
+  color: var(--magenta);
+  text-shadow: var(--glow-magenta);
+}
+
+/* Inputs: dark field, cyan focus ring. */
+.deck__input,
+.deck__select,
+.deck__field {
+  background: var(--bg-deep);
+  color: var(--text);
+  border: 1px solid var(--line);
+  border-radius: 0.4rem;
+  font-family: var(--font-mono);
+}
+.deck__input:focus,
+.deck__select:focus {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: var(--glow-cyan);
 }
