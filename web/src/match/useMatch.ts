@@ -166,8 +166,12 @@ export function useMatch(matchId = 'live', ticket?: string): MatchController {
    */
   const dispatch = useCallback(
     (action: MatchAction) => {
-      // Stage 1: authoritative rules-WASM name-gate (when the crate is loaded).
-      if (wasmGate.current && !wasmGate.current.recognizes(action.kind as CommandName)) {
+      // Stage 1: authoritative rules-WASM name-gate. Only meaningful ONLINE,
+      // where it proves the browser and server share one rules binary. In
+      // practice the local TS mirror is the sole authority (and stays current
+      // with the client's command set, e.g. AttackCmd), so the gate — which may
+      // be a stale compiled crate — must not veto a command the mirror handles.
+      if (mode === 'online' && wasmGate.current && !wasmGate.current.recognizes(action.kind as CommandName)) {
         raiseCorrection(`Rules engine does not recognize ${action.kind}`)
         rerender()
         return
