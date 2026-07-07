@@ -1910,6 +1910,43 @@
      "w_young_buck"
     ],
     "active": false
+   },
+   {
+    "deckId": "badge",
+    "name": "The Badge",
+    "cardIds": [
+     "pd_beat_cop",
+     "pd_beat_cop",
+     "pd_k9_unit",
+     "pd_k9_unit",
+     "pd_squad_car",
+     "pd_squad_car",
+     "pd_stakeout",
+     "pd_stakeout",
+     "pd_the_crib",
+     "pd_the_crib",
+     "pd_double_cuffed",
+     "pd_double_cuffed",
+     "pd_cell",
+     "pd_cell",
+     "pd_flashbang",
+     "pd_flashbang",
+     "pd_bailbonds",
+     "pd_bailbonds",
+     "pd_dirty_cop",
+     "pd_dirty_cop",
+     "pd_detective",
+     "pd_detective",
+     "bolt",
+     "bolt",
+     "jail",
+     "jail",
+     "pd_swat_captain",
+     "pd_police_station",
+     "pd_riot_squad",
+     "pd_accidental_bite"
+    ],
+    "active": false
    }
   ]
  }
