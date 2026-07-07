@@ -1136,3 +1136,99 @@ body {
   .app__nav-link { flex: 0 0 auto; padding: 0.5rem 1.1rem; }
   .app__content { max-width: 1100px; margin: 0 auto; width: 100%; }
 }
+
+/* ============================================================================
+   Data-screen cyberpunk pass — leaderboard, shop grid, collection grid.
+   Targets each view's own BEM classes on top of the theme token layer.
+   ============================================================================ */
+
+/* ── Leaderboard: a neon ranked table ─────────────────────────────────────── */
+.ranks__head { display: flex; align-items: baseline; gap: 0.75rem; flex-wrap: wrap; margin-bottom: 0.75rem; }
+.ranks__season { font-family: var(--font-mono); color: var(--muted); font-size: 0.8rem; }
+.ranks__season-id { color: var(--accent); }
+.ranks__list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 0.4rem; }
+.ranks__list > * ,
+.ranks__row {
+  display: grid;
+  grid-template-columns: 3rem 1fr auto auto;
+  align-items: center;
+  gap: 0.75rem;
+  padding: 0.7rem 0.9rem;
+  background: var(--surface-glass);
+  border: 1px solid var(--line);
+  border-radius: 0.6rem;
+}
+.ranks__rank {
+  font-family: var(--font-display);
+  font-size: 1.3rem;
+  text-align: center;
+  color: var(--muted);
+}
+/* Top-3 get medal glows: cyan / magenta / amber. */
+.ranks__list > *:nth-child(1) { border-color: var(--line-hot); box-shadow: var(--glow-cyan); }
+.ranks__list > *:nth-child(1) .ranks__rank { color: var(--accent); text-shadow: 0 0 12px rgba(0,229,255,0.7); }
+.ranks__list > *:nth-child(2) .ranks__rank { color: var(--magenta); text-shadow: var(--glow-magenta); }
+.ranks__list > *:nth-child(3) .ranks__rank { color: var(--amber); text-shadow: var(--glow-amber); }
+.ranks__name { font-family: var(--font-tech); letter-spacing: 0.03em; }
+.ranks__rating { font-family: var(--font-mono); color: var(--accent); }
+.ranks__stars { font-family: var(--font-mono); color: var(--amber); }
+.ranks__pager { display: flex; align-items: center; gap: 0.75rem; justify-content: center; margin-top: 1rem; }
+.ranks__page-label { font-family: var(--font-mono); color: var(--muted); font-size: 0.85rem; }
+
+/* ── Shop: responsive neon card grid ──────────────────────────────────────── */
+.shop__grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+  gap: 1rem;
+  margin-top: 1rem;
+}
+.shop__card { display: flex; flex-direction: column; gap: 0.5rem; padding: 1rem; }
+.shop__card-head { display: flex; align-items: center; justify-content: space-between; gap: 0.5rem; }
+.shop__card-name { font-size: 1.05rem; }
+.shop__card-desc { color: var(--muted); font-size: 0.85rem; flex: 1; }
+.shop__kind {
+  font-family: var(--font-mono); font-size: 0.65rem; text-transform: uppercase; letter-spacing: 0.08em;
+  padding: 0.15rem 0.5rem; border-radius: 999px; border: 1px solid var(--line-hot); color: var(--accent);
+}
+.shop__kind--token { color: var(--magenta); border-color: rgba(255,45,142,0.4); }
+.shop__card--token { border-color: rgba(255,45,142,0.28); }
+.shop__card--token:hover { box-shadow: var(--glow-magenta); border-color: var(--magenta); }
+.shop__price { font-family: var(--font-mono); font-size: 1.15rem; color: var(--amber); text-shadow: var(--glow-amber); }
+
+/* ── Collection / deck builder: card grid with cost + rarity chips ─────────── */
+.deck__filters { display: flex; gap: 0.5rem; flex-wrap: wrap; margin: 0.75rem 0; }
+.deck__cards {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+  gap: 0.75rem;
+}
+.deck__card {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+  padding: 0.75rem;
+  min-height: 84px;
+  background: linear-gradient(160deg, var(--surface-glass), rgba(4,20,26,0.6));
+  border: 1px solid var(--line);
+  border-radius: 0.6rem;
+  transition: border-color 0.15s ease, box-shadow 0.15s ease, transform 0.05s ease;
+}
+.deck__card:hover { border-color: var(--line-hot); box-shadow: var(--glow-cyan); transform: translateY(-2px); }
+.deck__card-name { font-family: var(--font-tech); font-size: 0.9rem; letter-spacing: 0.02em; }
+/* Juice cost: a glowing cyan coin in the top-left. */
+.deck__cost {
+  position: absolute; top: -0.5rem; left: -0.5rem;
+  width: 1.7rem; height: 1.7rem; display: grid; place-items: center;
+  font-family: var(--font-mono); font-weight: 600; font-size: 0.85rem;
+  color: #04141a; background: linear-gradient(135deg, var(--accent), var(--accent-glow));
+  border-radius: 50%; box-shadow: var(--glow-cyan);
+}
+.deck__count-badge {
+  align-self: flex-end; font-family: var(--font-mono); font-size: 0.7rem;
+  color: var(--muted); padding: 0.1rem 0.4rem; border: 1px solid var(--line); border-radius: 999px;
+}
+.deck__head { display: flex; align-items: center; justify-content: space-between; gap: 0.75rem; flex-wrap: wrap; }
+.deck__empty, .shop__empty, .ranks__empty {
+  color: var(--muted); font-family: var(--font-mono); text-align: center; padding: 2rem;
+}
