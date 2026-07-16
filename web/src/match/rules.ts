@@ -256,7 +256,15 @@ export function applyAction(state: MatchState, action: MatchAction): { state: Ma
       emit({ type: 'operators.readied', player: next })
       const top = cur.seats[next].deck[0]
       if (top) emit({ type: 'card.drawn', player: next, card: top })
-      emit({ type: 'turn.ended', player: me, nextPlayer: next, nextPlayerJuice: clamp(cur.seats[next].juice + JUICE_RAMP_PER_TURN, 0, JUICE_CAP) })
+      // The available pool ramps (+1, capped) and so does the crystal it refills
+      // to — mirroring the aggregate's `next_player_juice`/`next_player_max_juice`.
+      emit({
+        type: 'turn.ended',
+        player: me,
+        nextPlayer: next,
+        nextPlayerJuice: clamp(cur.seats[next].juice + JUICE_RAMP_PER_TURN, 0, JUICE_CAP),
+        nextPlayerMaxJuice: clamp(cur.seats[next].maxJuice + JUICE_RAMP_PER_TURN, 0, JUICE_CAP),
+      })
       break
     }
     case 'ConcedeMatchCmd': {
@@ -401,7 +409,7 @@ export function foldEvent(state: MatchState, event: DeltaEvent): MatchState {
       return patchSeat(state, event.player, (s) => ({ ...s, juice: event.remainingJuice }))
     case 'turn.ended':
       return {
-        ...patchSeat(state, event.nextPlayer, (s) => ({ ...s, juice: event.nextPlayerJuice })),
+        ...patchSeat(state, event.nextPlayer, (s) => ({ ...s, juice: event.nextPlayerJuice, maxJuice: event.nextPlayerMaxJuice })),
         turn: event.nextPlayer,
       }
     case 'match.completed':

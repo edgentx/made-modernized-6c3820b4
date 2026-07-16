@@ -147,6 +147,12 @@ export interface SeatState {
   readonly heat: number
   /** Currently available Juice pool (ramps each of the seat's turns). */
   readonly juice: number
+  /**
+   * The Juice crystal — the max the available pool refills to at the start of
+   * the seat's turn. Grows (+1, capped at {@link JUICE_CAP}) each of the seat's
+   * turns; mirrors the aggregate's `next_player_max_juice`.
+   */
+  readonly maxJuice: number
   /** Cards in hand this seat can play. */
   readonly hand: readonly HandCard[]
   /** Operators in play. */
@@ -184,6 +190,7 @@ export function seatFromOutfit(outfit: OutfitConfig): SeatState {
     bossHp: outfit.bossHp,
     heat: outfit.startingHeat,
     juice: outfit.availableJuice,
+    maxJuice: outfit.availableJuice,
     hand: [],
     board: [],
     deck: [],
@@ -236,7 +243,7 @@ export type DeltaEvent =
   | { readonly type: 'operators.readied'; readonly player: Seat }
   | { readonly type: 'operator.exhausted'; readonly player: Seat; readonly instanceId: string }
   | { readonly type: 'cop.raided'; readonly player: Seat; readonly bossHp: number; readonly newHeat: number }
-  | { readonly type: 'turn.ended'; readonly player: Seat; readonly nextPlayer: Seat; readonly nextPlayerJuice: number }
+  | { readonly type: 'turn.ended'; readonly player: Seat; readonly nextPlayer: Seat; readonly nextPlayerJuice: number; readonly nextPlayerMaxJuice: number }
   | { readonly type: 'match.completed'; readonly concedingPlayer: Seat; readonly winner: Seat }
 
 /** The `type()` string of a delta event (mirrors `event_type()`). */
