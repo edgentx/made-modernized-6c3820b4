@@ -137,6 +137,7 @@ Cards (and relics) are **tradeable blockchain assets** (NFT-style ownership; ERC
 - **Fee model (decided):** **free trade + a small royalty, WITH a minimum fee floor.** Effective fee = **`max(min_fee_to_cover_cost, royalty_pct × price)`**:
   - The **floor** always covers the on-chain/gas transaction cost, so **we can never lose money on a trade.**
   - The **royalty follows the asset**, so our take grows as a card appreciates.
+  - **Royalty rates (LOCKED):** **2.5%** on our own market, **5%** on external markets (OpenSea etc.). The lower own-market rate is the incentive to trade on ours; the external rate is set at the ERC-2981-typical ceiling so we still capture value when players use OpenSea. Both are always subject to the `max(floor, …)` guarantee.
 - **ALL transfers are monetized.** Peer-to-peer *trades* also carry the small fee, not just marketplace *sells* — every transfer brings in a small amount above cost. No free transfers; the floor always covers the on-chain charge plus a bit.
 - **Blockchain runs LOCAL until we move it to cloud** — this is the *one* component exempt from "everything is production/cloud." Market UX is production; the chain is local until stood up in cloud.
 
@@ -211,6 +212,6 @@ These are intentionally deferred; they are tuning/timing, not architecture, and 
 1. **Exact numeric tuning** — card stat lines, Juice costs per card, Boss HP totals within `LEGAL_STARTING_HP = 30..=90`, Heat-per-action beyond the base +1, idol buff magnitudes. (The *machinery* is specified; the *numbers* are balance work, and the living AI pipeline + balance validator will churn them continuously.)
 2. **PvP timing & shape** — when PvP ladder arrives on the shared engine, and its matchmaking/ranked details (`matchmaking_ticket`, `ranked_standing`, `season` are scaffolded but out of the PvE-first critical path).
 3. **Relic drop-rate formula parameters** — the exact activity→probability curve (§3.5). The *inputs* (players, hands, games) and the *shape* (activity-gated, seeded/auditable) are decided; the coefficients are tuning.
-4. **Marketplace fork specifics** — the fee *model* is decided (`max(floor, royalty)` on all transfers); the *royalty_pct* value and the OpenSea→own-market cutover schedule are open.
+4. **Marketplace fork specifics** — the fee *model* AND rates are now decided (`max(floor, royalty)` on all transfers; royalty **2.5%** own-market / **5%** external — §3.7). Only the OpenSea→own-market cutover schedule remains open.
 
 Everything above these four is settled design and can be built.
