@@ -896,6 +896,57 @@ pub struct CopEventTriggered {
     pub new_heat: i32,
 }
 
+/// A GainJuice card's Juice gain, carried by [`Event::JuiceGained`] and thus
+/// by the emitted `juice.gained` event. Playing a `CardEffect::GainJuice` card
+/// raises `available_juice`, capped at [`JUICE_CAP`]; this delta lets an
+/// online client reconstruct that mutation instead of desyncing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JuiceGained {
+    /// The match the Juice was gained in.
+    pub match_id: String,
+    /// The seat whose Juice rose.
+    pub player: Player,
+    /// The Juice gained by the card's declared amount (pre-cap).
+    pub amount: u8,
+    /// The seat's resulting available Juice after the gain (capped at
+    /// [`JUICE_CAP`]).
+    pub new_juice: u8,
+}
+
+/// A Cool effect's Heat reduction, carried by [`Event::HeatSet`] and thus by
+/// the emitted `heat.set` event. Both `CardEffect::Cool` and
+/// `HeroPowerEffect::Cool` lower `starting_heat`, floored at
+/// [`HEAT_BOUNDS`]'s start; this delta lets an online client reconstruct that
+/// mutation instead of desyncing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeatSet {
+    /// The match the Heat was lowered in.
+    pub match_id: String,
+    /// The seat whose Heat was lowered.
+    pub player: Player,
+    /// The seat's resulting Heat after the reduction (floored at
+    /// [`HEAT_BOUNDS`]'s start).
+    pub new_heat: i32,
+}
+
+/// A GainArmor hero power's Boss HP gain, carried by
+/// [`Event::BossArmorGained`] and thus by the emitted `boss.armor.gained`
+/// event. `HeroPowerEffect::GainArmor` raises the activating seat's own
+/// `boss_hp`; this delta lets an online client reconstruct that mutation
+/// instead of desyncing. (The client fold for `boss.armor.gained` is added in
+/// a follow-up task — the engine is the authority here.)
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BossArmorGained {
+    /// The match the armor was gained in.
+    pub match_id: String,
+    /// The seat whose Boss gained HP.
+    pub player: Player,
+    /// The HP gained by the hero power's declared amount.
+    pub amount: u8,
+    /// The Boss's resulting HP after the gain.
+    pub new_hp: i32,
+}
+
 /// A conceded match, carried by [`Event::MatchCompleted`] and thus by the
 /// emitted `match.completed` event. A concede forfeits for one seat, so the
 /// match ends yielding exactly one winner — the opposing seat.
@@ -953,6 +1004,12 @@ pub enum Event {
     CopEventTriggered(CopEventTriggered),
     /// A player conceded, forfeiting the match to the opposing seat.
     MatchCompleted(MatchCompleted),
+    /// A GainJuice card raised the acting player's available Juice.
+    JuiceGained(JuiceGained),
+    /// A Cool effect (card or hero power) lowered a seat's Heat.
+    HeatSet(HeatSet),
+    /// A GainArmor hero power raised the activating seat's own Boss HP.
+    BossArmorGained(BossArmorGained),
 }
 
 impl DomainEvent for Event {
@@ -975,6 +1032,9 @@ impl DomainEvent for Event {
             Event::TurnEnded(_) => "turn.ended",
             Event::CopEventTriggered(_) => "cop.event.triggered",
             Event::MatchCompleted(_) => "match.completed",
+            Event::JuiceGained(_) => "juice.gained",
+            Event::HeatSet(_) => "heat.set",
+            Event::BossArmorGained(_) => "boss.armor.gained",
         }
     }
 }
@@ -1875,10 +1935,23 @@ impl GameSession {
             CardEffect::GainJuice { amount } => {
                 let o = self.outfit_at_mut(seat);
                 o.available_juice = o.available_juice.saturating_add(amount).min(JUICE_CAP);
+                let new_juice = o.available_juice;
+                out.push(Event::JuiceGained(JuiceGained {
+                    match_id: mid,
+                    player: seat,
+                    amount,
+                    new_juice,
+                }));
             }
             CardEffect::Cool { amount } => {
                 let o = self.outfit_at_mut(seat);
                 o.starting_heat = (o.starting_heat - amount as i32).max(*HEAT_BOUNDS.start());
+                let new_heat = o.starting_heat;
+                out.push(Event::HeatSet(HeatSet {
+                    match_id: mid,
+                    player: seat,
+                    new_heat,
+                }));
             }
         }
         out
@@ -2220,13 +2293,26 @@ impl GameSession {
             HeroPowerEffect::GainArmor { amount } => {
                 let outfit = self.outfit_at_mut(seat);
                 outfit.boss_hp += amount as i32;
-                Vec::new()
+                let new_hp = outfit.boss_hp;
+                let mid = self.match_id.clone();
+                vec![Event::BossArmorGained(BossArmorGained {
+                    match_id: mid,
+                    player: seat,
+                    amount,
+                    new_hp,
+                })]
             }
             HeroPowerEffect::Cool { amount } => {
                 let outfit = self.outfit_at_mut(seat);
                 outfit.starting_heat =
                     (outfit.starting_heat - amount as i32).max(*HEAT_BOUNDS.start());
-                Vec::new()
+                let new_heat = outfit.starting_heat;
+                let mid = self.match_id.clone();
+                vec![Event::HeatSet(HeatSet {
+                    match_id: mid,
+                    player: seat,
+                    new_heat,
+                })]
             }
             HeroPowerEffect::SummonToken { atk, hp } => {
                 // A full board is not a rejection — the token is just not
@@ -4311,9 +4397,10 @@ mod tests {
         assert!(matches!(err, DomainError::InvariantViolation(_)));
     }
 
-    // Scenario (Task 7): a GainArmor hero power raises the activating seat's
-    // own Boss HP, with no target-side event (mirrors CardEffect::GainJuice /
-    // Cool, which likewise mutate quietly).
+    // Scenario (Task 7, updated by Task 7.5 remediation): a GainArmor hero
+    // power raises the activating seat's own Boss HP, no target-side event,
+    // but now DOES emit its own BossArmorGained delta (Task 7.5) so online
+    // clients can reconstruct the boss_hp change.
     #[test]
     fn hero_power_gain_armor_raises_own_boss_hp() {
         let mut session = seated_match();
@@ -4330,7 +4417,11 @@ mod tests {
             .execute(ActivateHeroPower::new("m-1", "m-1-a", "boss:B", 2).into_command())
             .expect("affordable hero power");
 
-        assert_eq!(events.len(), 1, "GainArmor mutates quietly, no extra delta");
+        assert_eq!(
+            events.len(),
+            2,
+            "HeroPowerActivated + BossArmorGained (Task 7.5)"
+        );
         assert_eq!(session.outfit_at(Player::A).boss_hp, 25);
     }
 
@@ -4421,6 +4512,70 @@ mod tests {
             3,
             "Juice is still spent"
         );
+    }
+
+    // Scenario (Task 7.5 remediation): a GainJuice card raises available_juice
+    // but previously emitted no delta, desyncing online clients. Playing it now
+    // emits a JuiceGained event carrying the resulting (capped) available_juice.
+    #[test]
+    fn play_gain_juice_card_emits_juice_gained_delta() {
+        let mut session = seated_match();
+        session.seat_state_at_mut(Player::A).hand.push(
+            test_card_instance("A-comeup-0", 2, CardType::Piece, CardEffect::GainJuice { amount: 2 }, 0, 0, &[]));
+        give_juice(&mut session, Player::A, 5);
+
+        // Deviation from the brief's verbatim "": play_card unconditionally
+        // rejects an empty targetRef (a pre-existing, Task-7.5-unrelated
+        // invariant) even though resolve_effect's GainJuice arm never reads
+        // it; "self" is an inert placeholder that only satisfies that check.
+        let events = session
+            .execute(PlayCard::new("m-1", "m-1-a", "A-comeup-0", "self", 2).into_command())
+            .expect("gain-juice card plays");
+
+        // available was 5, spent 2 (cost) -> 3, then +2 gained -> 5 (capped at 10).
+        assert!(events.iter().any(|e| matches!(e, Event::JuiceGained(j) if j.player == Player::A && j.amount == 2 && j.new_juice == 5)));
+    }
+
+    // Scenario (Task 7.5 remediation): a Cool card lowers starting_heat but
+    // previously emitted no delta. Playing it now emits a HeatSet event
+    // carrying the resulting (floored) starting_heat.
+    #[test]
+    fn play_cool_card_emits_heat_set_delta() {
+        let mut session = seated_match();
+        // Seat A starts with some heat so Cool has something to lower.
+        let mut a = OutfitConfig::new("m-1-a"); a.max_juice = 5; a.available_juice = 5; a.starting_heat = 4;
+        session.configure_player_a(a);
+        session.set_opening_player(Some(Player::A));
+        session.seat_state_at_mut(Player::A).hand.push(
+            test_card_instance("A-crib-0", 2, CardType::Piece, CardEffect::Cool { amount: 2 }, 0, 0, &[]));
+
+        // Deviation from the brief's verbatim "": see the identical note in
+        // play_gain_juice_card_emits_juice_gained_delta above.
+        let events = session
+            .execute(PlayCard::new("m-1", "m-1-a", "A-crib-0", "self", 2).into_command())
+            .expect("cool card plays");
+
+        // Heat 4, +1 from playing the card (HEAT_PER_PLAY), then Cool -2 -> 3.
+        assert!(events.iter().any(|e| matches!(e, Event::HeatSet(h) if h.player == Player::A && h.new_heat == 3)));
+    }
+
+    // Scenario (Task 7.5 remediation): a GainArmor hero power raises boss_hp
+    // but previously emitted no delta. Activating it now emits a
+    // BossArmorGained event carrying the resulting boss_hp.
+    #[test]
+    fn hero_power_gain_armor_emits_boss_armor_gained_delta() {
+        let mut session = seated_match();
+        let mut a = OutfitConfig::new("m-1-a"); a.max_juice = 5; a.available_juice = 5;
+        a.boss_hp = 30; a.hero_power_effect = domain::boss_definition::HeroPowerEffect::GainArmor { amount: 4 }; a.hero_power_cost = 2;
+        session.configure_player_a(a);
+        session.set_opening_player(Some(Player::A));
+
+        let events = session
+            .execute(ActivateHeroPower::new("m-1", "m-1-a", "boss:A", 2).into_command())
+            .expect("gain-armor hero power");
+
+        assert!(events.iter().any(|e| matches!(e, Event::BossArmorGained(b) if b.player == Player::A && b.amount == 4 && b.new_hp == 34)));
+        assert_eq!(session.outfit_at(Player::A).boss_hp, 34);
     }
 
     // Scenario (Task 7): end_turn's start-of-turn trademark seam resolves the

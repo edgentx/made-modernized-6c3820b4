@@ -573,6 +573,23 @@ fn delta_event_json(event: &Event) -> serde_json::Value {
             "winningPlayerId": e.winning_player_id,
             "winner": player_tag(e.winner),
         }),
+        Event::JuiceGained(e) => json!({
+            "matchId": e.match_id,
+            "player": player_tag(e.player),
+            "amount": e.amount,
+            "newJuice": e.new_juice,
+        }),
+        Event::HeatSet(e) => json!({
+            "matchId": e.match_id,
+            "player": player_tag(e.player),
+            "newHeat": e.new_heat,
+        }),
+        Event::BossArmorGained(e) => json!({
+            "matchId": e.match_id,
+            "player": player_tag(e.player),
+            "amount": e.amount,
+            "newHp": e.new_hp,
+        }),
     }
 }
 
