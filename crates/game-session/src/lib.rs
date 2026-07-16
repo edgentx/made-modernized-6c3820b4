@@ -74,7 +74,7 @@ use std::ops::RangeInclusive;
 use serde::{Deserialize, Serialize};
 
 use domain::boss_definition::{HeroPowerEffect, TrademarkEffect, TrademarkTrigger};
-use domain::card_definition::CardType;
+use domain::card_definition::{CardClass, CardType};
 use shared::{Aggregate, AggregateRoot, Command, DomainError, DomainEvent, Repository};
 
 /// Stable aggregate type name, surfaced in [`DomainError::UnknownCommand`] and
@@ -104,6 +104,10 @@ const RESOLVE_COP_EVENT: &str = "ResolveCopEventCmd";
 
 /// The `ConcedeMatchCmd` command name [`GameSession::execute`] recognizes.
 const CONCEDE_MATCH: &str = "ConcedeMatchCmd";
+
+/// The `ResolveVenueEventCmd` command name [`GameSession::execute`]
+/// recognizes (Task 10, City-pillar hook).
+const RESOLVE_VENUE_EVENT: &str = "ResolveVenueEventCmd";
 
 /// Heat a player gains each time they play a card. Playing a card always raises
 /// Heat, so a successful [`PlayCard`] emits an accompanying `heat.raised` event.
@@ -638,6 +642,57 @@ impl ConcedeMatch {
     }
 }
 
+/// The `ResolveVenueEventCmd` payload (Task 10, City-pillar hook): the match
+/// being played, a reference into the venue's event table, and the seeded RNG
+/// draw that selects the entry. Unlike [`ResolveCopEvent`], a venue event is
+/// a neutral, match-level draw — it names no acting player and is not gated
+/// on whose turn it is. Field names are the match-play schema's `camelCase`.
+///
+/// Build one directly and turn it into a [`Command`] with
+/// [`ResolveVenueEvent::into_command`], or decode it from a command payload
+/// via [`serde_json`] inside [`GameSession::execute`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ResolveVenueEvent {
+    /// Identifier of the match being played; must name the match this session
+    /// records.
+    pub match_id: String,
+    /// Reference into the venue's event table this draw resolves against. In
+    /// Subsystem 1 the table is a single no-op entry; Subsystem 3 grows it
+    /// with real venue events.
+    pub event_table_ref: String,
+    /// The seeded RNG draw that selects the entry from the venue event table.
+    pub rng_draw: u8,
+}
+
+impl ResolveVenueEvent {
+    /// The command name this maps to.
+    pub const COMMAND: &'static str = RESOLVE_VENUE_EVENT;
+
+    /// Build a `ResolveVenueEventCmd` for `match_id`, resolving the venue
+    /// event selected by the seeded `rng_draw` from `event_table_ref`.
+    pub fn new(
+        match_id: impl Into<String>,
+        event_table_ref: impl Into<String>,
+        rng_draw: u8,
+    ) -> Self {
+        Self {
+            match_id: match_id.into(),
+            event_table_ref: event_table_ref.into(),
+            rng_draw,
+        }
+    }
+
+    /// Encode this command as a [`shared::Command`] carrying a JSON payload,
+    /// ready to hand to [`GameSession::execute`].
+    pub fn into_command(&self) -> Command {
+        // Serialization of a plain data struct to a Vec cannot fail here.
+        let payload =
+            serde_json::to_vec(self).expect("ResolveVenueEvent is always serializable");
+        Command::with_payload(Self::COMMAND, payload)
+    }
+}
+
 /// The started match, carried by [`Event::MatchStarted`] and thus by the emitted
 /// `match.started` event.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -965,6 +1020,22 @@ pub struct MatchCompleted {
     pub winner: Player,
 }
 
+/// A resolved venue event (Task 10, City-pillar hook), carried by
+/// [`Event::VenueEventResolved`] and thus by the emitted
+/// `venue.event.resolved` event. Subsystem 1's venue event table is a single
+/// no-op entry — the draw selects it and changes nothing; Subsystem 3 grows
+/// the table with real venue events.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VenueEventResolved {
+    /// The match the venue event fired in.
+    pub match_id: String,
+    /// Reference into the venue's event table the draw resolved against.
+    pub event_table_ref: String,
+    /// The seeded RNG draw that selected the entry from the venue event
+    /// table.
+    pub rng_draw: u8,
+}
+
 /// Domain events emitted by [`GameSession`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Event {
@@ -1010,6 +1081,9 @@ pub enum Event {
     HeatSet(HeatSet),
     /// A GainArmor hero power raised the activating seat's own Boss HP.
     BossArmorGained(BossArmorGained),
+    /// A venue event (Task 10, City-pillar hook) was resolved from the
+    /// seeded venue event table.
+    VenueEventResolved(VenueEventResolved),
 }
 
 impl DomainEvent for Event {
@@ -1035,6 +1109,7 @@ impl DomainEvent for Event {
             Event::JuiceGained(_) => "juice.gained",
             Event::HeatSet(_) => "heat.set",
             Event::BossArmorGained(_) => "boss.armor.gained",
+            Event::VenueEventResolved(_) => "venue.event.resolved",
         }
     }
 }
@@ -1106,6 +1181,12 @@ pub struct CardInstance {
     pub hp: u8,                    // 0 for non-unit cards
     pub keywords: Vec<Keyword>,
     pub boss_lock: Option<String>, // Some(boss_id) if boss-locked (Task 8)
+    /// The card's class allegiance (Task 10, City-pillar hook); defaults to
+    /// [`CardClass::Neutral`] for the closed practice pool. Lets a
+    /// [`LocationModifier`]'s `class_boosts` key off it downstream on the
+    /// board via [`BoardUnit::class`].
+    #[serde(default = "default_card_class")]
+    pub class: CardClass,
 }
 
 /// A unit on the board (summoned Operator or Vehicle).
@@ -1119,6 +1200,19 @@ pub struct BoardUnit {
     pub ready: bool,      // false the turn it arrives (summoning sickness)
     pub is_vehicle: bool, // counts against MAX_VEHICLES vs MAX_OPERATORS
     pub keywords: Vec<Keyword>,
+    /// The unit's class allegiance (Task 10, City-pillar hook), populated
+    /// from the summoning [`CardInstance`]; defaults to
+    /// [`CardClass::Neutral`]. The single key
+    /// [`GameSession::apply_location_modifiers`] matches against.
+    #[serde(default = "default_card_class")]
+    pub class: CardClass,
+}
+
+/// Default class for a card/unit with no class data (the closed practice
+/// pool, hero-power tokens): [`CardClass::Neutral`] never matches a
+/// [`LocationModifier`]'s `class_boosts`, so it is always a safe default.
+fn default_card_class() -> CardClass {
+    CardClass::Neutral
 }
 
 /// Live per-seat state that the scalar OutfitConfig cannot express: the hand,
@@ -1129,6 +1223,27 @@ pub struct SeatState {
     pub hand: Vec<CardInstance>,
     pub deck: Vec<CardInstance>, // server-secret; ordered
     pub board: Vec<BoardUnit>,
+}
+
+/// The City pillar's neutral venue modifier (Task 10, the City-pillar hook):
+/// a match is played at a venue whose modifiers affect BOTH seats alike. This
+/// is the seam Subsystem 3 fills with real content (a venue catalog, event
+/// tables, the growing map) — Subsystem 1 ships the plumbing only, so
+/// [`GameSession`]'s `location` defaults `None` and every existing test stays
+/// green (see [`GameSession::apply_location_modifiers`]).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
+pub struct LocationModifier {
+    pub location_id: String,
+    /// Data-driven venue kind, e.g. `"bank"` | `"chop_shop"`.
+    pub location_type: String,
+    /// Neutral atk boosts by class; applies to BOTH seats via
+    /// [`GameSession::apply_location_modifiers`].
+    pub class_boosts: Vec<(CardClass, i8)>,
+    /// Multiplier applied to Heat gain at this venue (Subsystem 3 content;
+    /// unused by Subsystem 1's plumbing). Default `1`.
+    pub heat_multiplier: u8,
+    /// Reference into the venue event table, drawn by [`ResolveVenueEvent`].
+    pub event_table_ref: Option<String>,
 }
 
 /// One entry in the closed practice card pool: a card definition's fixed
@@ -1213,6 +1328,7 @@ fn build_deck(seed: u64, seat: Player) -> Vec<CardInstance> {
             hp: def.hp,
             keywords: def.keywords.to_vec(),
             boss_lock: None,
+            class: CardClass::Neutral,
         });
         n += 1;
     }
@@ -1256,6 +1372,10 @@ pub struct GameSession {
     seat_a: SeatState,
     /// Live per-seat state for player `B` (hand/deck/board).
     seat_b: SeatState,
+    /// The venue this match is played at (Task 10, City-pillar hook). `None`
+    /// (the default) makes [`GameSession::apply_location_modifiers`] an
+    /// identity — the seam Subsystem 3 fills with real venue content.
+    location: Option<LocationModifier>,
 }
 
 impl GameSession {
@@ -1275,6 +1395,7 @@ impl GameSession {
             opening_player: Some(Player::A),
             seat_a: SeatState::default(),
             seat_b: SeatState::default(),
+            location: None,
         }
     }
 
@@ -1312,6 +1433,27 @@ impl GameSession {
     /// ill-formed, turn-less setup).
     pub fn set_opening_player(&mut self, player: Option<Player>) {
         self.opening_player = player;
+    }
+
+    /// Set the venue this match is played at (Task 10, City-pillar hook).
+    /// Configuring `None` (the default) restores identity behavior in
+    /// [`GameSession::apply_location_modifiers`].
+    pub fn set_location(&mut self, location: LocationModifier) {
+        self.location = Some(location);
+    }
+
+    /// The ONE place location modifiers touch unit stats. Identity when no
+    /// location is set; otherwise applies neutral class boosts (both seats).
+    fn apply_location_modifiers(&self, _seat: Player, base: &BoardUnit) -> BoardUnit {
+        let mut out = base.clone();
+        if let Some(loc) = &self.location {
+            for (class, delta) in &loc.class_boosts {
+                if *class == out.class {
+                    out.atk = (out.atk as i16 + *delta as i16).max(0) as u8;
+                }
+            }
+        }
+        out
     }
 
     /// Both Outfits paired with the seat they occupy, for the per-Outfit
@@ -1961,6 +2103,7 @@ impl GameSession {
                     ready: false,
                     is_vehicle: matches!(card.card_type, CardType::Vehicle),
                     keywords: card.keywords.clone(),
+                    class: card.class,
                 };
                 self.seat_state_at_mut(seat).board.push(unit.clone());
                 out.push(Event::OperatorSummoned(OperatorSummoned {
@@ -2073,7 +2216,11 @@ impl GameSession {
                 cmd.attacker_id
             )));
         }
-        let attacker_atk = attacker.atk;
+        // Consult the location-modifier seam (Task 10, City-pillar hook) at the
+        // ONE place combat reads the attacker's atk. Identity when no location
+        // is set (Subsystem 1's default); Subsystem 3's venue content boosts
+        // matching classes for both seats here without touching this call site.
+        let attacker_atk = self.apply_location_modifiers(seat, attacker).atk;
 
         // Spotlight: if the defender has any Spotlight unit, the target must be one.
         let has_spotlight = self
@@ -2383,6 +2530,7 @@ impl GameSession {
                     ready: false,
                     is_vehicle: false,
                     keywords: Vec::new(),
+                    class: CardClass::Neutral,
                 };
                 self.seat_state_at_mut(seat).board.push(unit.clone());
                 let mid = self.match_id.clone();
@@ -2651,6 +2799,47 @@ impl GameSession {
         self.root.record(Box::new(completed.clone()));
         Ok(vec![completed])
     }
+
+    /// Handle `ResolveVenueEventCmd` (Task 10, City-pillar hook): verify the
+    /// command targets this match, enforce every match-play invariant, and
+    /// draw from the seeded venue event table, emitting
+    /// [`Event::VenueEventResolved`]. Unlike [`GameSession::resolve_cop_event`],
+    /// a venue event is a neutral, match-level draw — it names no acting
+    /// player and is not gated on whose turn it is. Subsystem 1's table is a
+    /// single no-op entry (the draw selects it and changes nothing);
+    /// Subsystem 3 grows the table with real venue events.
+    fn resolve_venue_event(&mut self, cmd: ResolveVenueEvent) -> Result<Vec<Event>, DomainError> {
+        // The command must name the match this session actually records.
+        if cmd.match_id != self.match_id {
+            return Err(DomainError::InvariantViolation(format!(
+                "command targets match '{}' but this session records '{}'",
+                cmd.match_id, self.match_id
+            )));
+        }
+        // A venue event table reference must be named.
+        if cmd.event_table_ref.trim().is_empty() {
+            return Err(DomainError::InvariantViolation(
+                "an eventTableRef must be provided".to_string(),
+            ));
+        }
+
+        // Enforce every match-play invariant before resolving the venue event.
+        self.ensure_boards_within_caps()?;
+        self.ensure_heat_within_bounds()?;
+        self.ensure_starting_juice_valid()?;
+        self.ensure_decks_nonempty()?;
+        self.ensure_heists_prereqs_satisfied()?;
+        self.ensure_bosses_alive()?;
+        self.ensure_opening_player_designated()?;
+
+        let resolved = Event::VenueEventResolved(VenueEventResolved {
+            match_id: cmd.match_id,
+            event_table_ref: cmd.event_table_ref,
+            rng_draw: cmd.rng_draw,
+        });
+        self.root.record(Box::new(resolved.clone()));
+        Ok(vec![resolved])
+    }
 }
 
 impl Aggregate for GameSession {
@@ -2717,6 +2906,15 @@ impl Aggregate for GameSession {
                     ))
                 })?;
                 self.concede_match(cmd)
+            }
+            RESOLVE_VENUE_EVENT => {
+                let cmd: ResolveVenueEvent =
+                    serde_json::from_slice(&command.payload).map_err(|e| {
+                        DomainError::InvariantViolation(format!(
+                            "malformed ResolveVenueEventCmd payload: {e}"
+                        ))
+                    })?;
+                self.resolve_venue_event(cmd)
             }
             // Any other command is unknown to this aggregate.
             _ => Err(DomainError::unknown_command(
@@ -2954,6 +3152,7 @@ mod tests {
             hp: 0,
             keywords: vec![],
             boss_lock: Some("some-other-boss".to_string()),
+            class: CardClass::Neutral,
         };
 
         let err = GameSession::ensure_boss_locks_honored(
@@ -3456,6 +3655,7 @@ mod tests {
             hp,
             keywords: kws.to_vec(),
             boss_lock: None,
+            class: CardClass::Neutral,
         }
     }
 
@@ -3930,7 +4130,15 @@ mod tests {
 
     /// Build a board unit for combat tests.
     fn test_unit(id: &str, atk: u8, hp: u8, ready: bool, is_vehicle: bool, kws: &[Keyword]) -> BoardUnit {
-        BoardUnit { instance_id: id.to_string(), card_id: "test".to_string(), atk, hp, max_hp: hp, ready, is_vehicle, keywords: kws.to_vec() }
+        BoardUnit { instance_id: id.to_string(), card_id: "test".to_string(), atk, hp, max_hp: hp, ready, is_vehicle, keywords: kws.to_vec(), class: CardClass::Neutral }
+    }
+
+    /// Build a Hacker-class board unit for location-modifier seam tests
+    /// (Task 10): ready, non-vehicle, no keywords, tagged `CardClass::Hacker`.
+    fn hacker_unit(id: &str, atk: u8, hp: u8) -> BoardUnit {
+        let mut unit = test_unit(id, atk, hp, true, false, &[]);
+        unit.class = CardClass::Hacker;
+        unit
     }
 
     #[test]
@@ -5630,5 +5838,112 @@ mod tests {
         assert_eq!(command.name, ConcedeMatch::COMMAND);
         let decoded: ConcedeMatch = serde_json::from_slice(&command.payload).unwrap();
         assert_eq!(decoded, valid_concede());
+    }
+
+    // ---- Location-modifier seam / ResolveVenueEventCmd (Task 10) -----------
+    //
+    // The City pillar's neutral venue modifier: `location: None` (the
+    // default) must leave every pre-existing test above green — the hook
+    // only does anything when a location is present.
+
+    #[test]
+    fn location_none_is_identity() {
+        let session = valid_session(); // location defaults None
+        let base = test_unit("u", 3, 3, true, false, &[]);
+        let out = session.apply_location_modifiers(Player::A, &base);
+        assert_eq!(out, base, "no location => identity");
+    }
+
+    #[test]
+    fn location_boosts_matching_class_for_both_seats() {
+        let mut session = valid_session();
+        session.set_location(LocationModifier {
+            location_id: "farm-1".into(),
+            location_type: "server_farm".into(),
+            class_boosts: vec![(CardClass::Hacker, 1)],
+            heat_multiplier: 1,
+            event_table_ref: None,
+        });
+        // A Hacker-class unit gets +1 atk regardless of which seat owns it.
+        let base = hacker_unit("h", 2, 2);
+        assert_eq!(session.apply_location_modifiers(Player::A, &base).atk, 3);
+        assert_eq!(session.apply_location_modifiers(Player::B, &base).atk, 3);
+    }
+
+    #[test]
+    fn location_does_not_boost_non_matching_class() {
+        let mut session = valid_session();
+        session.set_location(LocationModifier {
+            location_id: "farm-1".into(),
+            location_type: "server_farm".into(),
+            class_boosts: vec![(CardClass::Hacker, 1)],
+            heat_multiplier: 1,
+            event_table_ref: None,
+        });
+        // A Neutral-class unit is untouched by a Hacker-only boost.
+        let base = test_unit("n", 2, 2, true, false, &[]);
+        assert_eq!(session.apply_location_modifiers(Player::A, &base).atk, 2);
+    }
+
+    #[test]
+    fn location_none_leaves_combat_unaffected() {
+        // The consult point in declare_attack is a no-op with location=None.
+        let mut session = valid_session();
+        session.set_opening_player(Some(Player::A));
+        session
+            .seat_state_at_mut(Player::A)
+            .board
+            .push(hacker_unit("A-hacker", 2, 2));
+        session
+            .seat_state_at_mut(Player::B)
+            .board
+            .push(test_unit("B-def", 0, 5, true, false, &[]));
+
+        let events = session
+            .execute(Attack::new("m-1", "m-1-a", "A-hacker", "op:B-def").into_command())
+            .expect("A attacks B's unit");
+        assert!(events.iter().any(
+            |e| matches!(e, Event::OperatorDamaged(d) if d.instance_id == "B-def" && d.new_hp == 3)
+        ));
+    }
+
+    // ---- ResolveVenueEventCmd ------------------------------------------
+
+    #[test]
+    fn resolve_venue_event_emits_delta_and_is_seeded() {
+        let mut session = valid_session();
+        let events = session
+            .execute(ResolveVenueEvent::new("m-1", "table-noop", 0).into_command())
+            .expect("venue event resolves");
+        assert!(events.iter().any(|e| e.event_type() == "venue.event.resolved"));
+    }
+
+    #[test]
+    fn resolve_venue_event_rejects_when_command_targets_a_different_match() {
+        let mut session = valid_session();
+        let err = session
+            .execute(ResolveVenueEvent::new("other-match", "table-noop", 0).into_command())
+            .expect_err("a mismatched match id must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(session.version(), 0);
+    }
+
+    #[test]
+    fn resolve_venue_event_rejects_blank_event_table_ref() {
+        let mut session = valid_session();
+        let err = session
+            .execute(ResolveVenueEvent::new("m-1", "  ", 0).into_command())
+            .expect_err("a blank eventTableRef must be rejected");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+        assert_eq!(session.version(), 0);
+    }
+
+    #[test]
+    fn resolve_venue_event_command_payload_round_trips() {
+        let cmd = ResolveVenueEvent::new("m-1", "table-noop", 0);
+        let command = cmd.into_command();
+        assert_eq!(command.name, ResolveVenueEvent::COMMAND);
+        let decoded: ResolveVenueEvent = serde_json::from_slice(&command.payload).unwrap();
+        assert_eq!(decoded, ResolveVenueEvent::new("m-1", "table-noop", 0));
     }
 }

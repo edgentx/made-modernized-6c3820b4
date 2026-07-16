@@ -590,6 +590,11 @@ fn delta_event_json(event: &Event) -> serde_json::Value {
             "amount": e.amount,
             "newHp": e.new_hp,
         }),
+        Event::VenueEventResolved(e) => json!({
+            "matchId": e.match_id,
+            "eventTableRef": e.event_table_ref,
+            "rngDraw": e.rng_draw,
+        }),
     }
 }
 

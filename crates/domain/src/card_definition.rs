@@ -100,7 +100,7 @@ impl CardType {
 
 /// A card's class allegiance. A card belongs to exactly one class, or is
 /// [`CardClass::Neutral`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum CardClass {
     Neutral,
     Boss,
