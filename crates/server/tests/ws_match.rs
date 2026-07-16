@@ -65,6 +65,18 @@ fn match_script(match_id: &str, seed: u64) -> Vec<(&'static str, Value)> {
     ]
 }
 
+/// The acting player id for a script step: the authenticated envelope identity
+/// the socket handler would carry. These full-command payloads already embed the
+/// acting `playerId` (except `StartMatch`, which names no acting player — the
+/// host stands in, and the hub stamps a harmless `playerId` the aggregate
+/// ignores), so reading it back mirrors what the real `/ws` envelope supplies.
+fn actor_of(payload: &Value) -> &str {
+    payload
+        .get("playerId")
+        .and_then(Value::as_str)
+        .unwrap_or("host-player")
+}
+
 /// Play the whole script against a fresh in-memory hub (no IO), returning the
 /// sealed checksum, the winning seat, and the ordered `(seq, event_type)` delta
 /// stream — the reference the live run is reproduced against.
@@ -75,7 +87,7 @@ fn play_pure(match_id: &str, seed: u64) -> (String, String, Vec<(u64, String)>) 
     let mut checksum = String::new();
     let mut winner = String::new();
     for (command, payload) in match_script(match_id, seed) {
-        match hub.apply_action(match_id, command, &payload) {
+        match hub.apply_action(match_id, command, actor_of(&payload), &payload) {
             ApplyOutcome::Applied(applied) => {
                 for d in &applied.new_deltas {
                     deltas.push((d.seq, d.event_type.clone()));
@@ -109,7 +121,7 @@ async fn full_ws_match_persists_replay_and_reproduces_from_seed(pool: PgPool) {
     let mut applied_deltas: Vec<(u64, String)> = Vec::new();
     let mut completion = None;
     for (command, payload) in match_script(match_id, SEED) {
-        let applied = match state.hub.apply_action(match_id, command, &payload) {
+        let applied = match state.hub.apply_action(match_id, command, actor_of(&payload), &payload) {
             ApplyOutcome::Applied(applied) => applied,
             other => panic!("{command} was not applied: {other:?}"),
         };
