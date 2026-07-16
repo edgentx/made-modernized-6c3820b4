@@ -181,6 +181,10 @@ pub struct OutfitConfig {
     /// [`JUICE_CAP`]. A card may only be played when its Juice cost does not
     /// exceed this amount (see [`GameSession::ensure_card_affordable`]).
     pub available_juice: u8,
+    /// The seat's max-Juice "crystal": the ceiling `available_juice` refills to
+    /// at the start of each of the owner's turns. Grows by `JUICE_RAMP_PER_TURN`
+    /// each of the owner's turns, hard-capped at `JUICE_CAP`, INDEPENDENT of spend.
+    pub max_juice: u8,
     /// Whether a Heist has been marked resolved for this Outfit at start.
     pub heist_resolved: bool,
     /// Outstanding prerequisites in this Outfit's Heist prerequisite queue. A
@@ -206,6 +210,7 @@ impl OutfitConfig {
             // A few turns in from the opening: enough ramped Juice to afford a
             // modestly-costed card, still comfortably within the hard cap.
             available_juice: 3,
+            max_juice: 3,
             heist_resolved: false,
             outstanding_heist_prereqs: 0,
         }
@@ -748,6 +753,9 @@ pub struct TurnEnded {
     /// The incoming seat's available Juice after ramping (+1, hard-capped at
     /// [`JUICE_CAP`]).
     pub next_player_juice: u8,
+    /// The incoming seat's grown max-Juice crystal (what `next_player_juice`
+    /// refills to). Lets the client render the crystal, not just the pool.
+    pub next_player_max_juice: u8,
 }
 
 /// A resolved Cop Event, carried by [`Event::CopEventTriggered`] and thus by the
@@ -979,6 +987,12 @@ impl GameSession {
                 return Err(DomainError::InvariantViolation(format!(
                     "player {seat:?} Outfit '{}' has available Juice {}, exceeding the hard cap of {JUICE_CAP}",
                     outfit.name, outfit.available_juice
+                )));
+            }
+            if outfit.max_juice > JUICE_CAP {
+                return Err(DomainError::InvariantViolation(format!(
+                    "player {seat:?} Outfit '{}' has max Juice {}, exceeding the hard cap of {JUICE_CAP}",
+                    outfit.name, outfit.max_juice
                 )));
             }
         }
@@ -1306,6 +1320,14 @@ impl GameSession {
         self.ensure_card_affordable(seat, cmd.juice_cost)?;
         let new_heat = self.heat_after_play(seat)?;
 
+        // Mutate state: deduct the Juice and persist the Heat raise. (Previously
+        // play_card only emitted these deltas without applying them — the bug.)
+        {
+            let outfit = self.outfit_at_mut(seat);
+            outfit.available_juice -= cmd.juice_cost;
+            outfit.starting_heat = new_heat;
+        }
+
         // A successful play emits the card first, then the Heat it raised.
         let played = Event::CardPlayed(CardPlayed {
             match_id: cmd.match_id.clone(),
@@ -1479,12 +1501,12 @@ impl GameSession {
         Ok(vec![activated])
     }
 
-    /// Juice-ramp: a seat's available Juice ramps [`JUICE_RAMP_PER_TURN`] each of
-    /// the owner's turns and is hard-capped at [`JUICE_CAP`]. Returns the ramped,
-    /// capped value for `seat`.
-    fn ramped_juice(&self, seat: Player) -> u8 {
+    /// Grow the seat's max-Juice crystal by one, capped at `JUICE_CAP`.
+    /// INDEPENDENT of how much was spent last turn — this is the fix for the
+    /// pin-at-1 bug (the old `ramped_juice` grew the *remaining* pool).
+    fn grown_crystal(&self, seat: Player) -> u8 {
         self.outfit_at(seat)
-            .available_juice
+            .max_juice
             .saturating_add(JUICE_RAMP_PER_TURN)
             .min(JUICE_CAP)
     }
@@ -1546,14 +1568,17 @@ impl GameSession {
         // The turn passes to the opponent, whose turn now begins: their Juice
         // ramps and they resolve a start-of-turn draw.
         let incoming = Self::opponent_of(seat);
-        let next_player_juice = self.ramped_juice(incoming);
+        let next_player_max_juice = self.grown_crystal(incoming);
+        let next_player_juice = next_player_max_juice; // refill available TO the crystal
         let (fatigue_amount, boss_hp_remaining) = self.resolve_start_of_turn_draw(incoming);
         let incoming_player_id = self.outfit_at(incoming).name.clone();
 
-        // Apply the passed turn to the aggregate: ramp the incoming seat's Juice,
-        // apply any start-of-turn Fatigue to its Boss, and hand it the turn.
+        // Apply the passed turn to the aggregate: grow the incoming seat's
+        // crystal, refill its available Juice to that crystal, apply any
+        // start-of-turn Fatigue to its Boss, and hand it the turn.
         {
             let outfit = self.outfit_at_mut(incoming);
+            outfit.max_juice = next_player_max_juice;
             outfit.available_juice = next_player_juice;
             outfit.boss_hp = boss_hp_remaining;
         }
@@ -1574,6 +1599,7 @@ impl GameSession {
             player: seat,
             next_player: incoming,
             next_player_juice,
+            next_player_max_juice,
         });
         self.root.record(Box::new(fatigue.clone()));
         self.root.record(Box::new(ended.clone()));
@@ -2307,6 +2333,66 @@ mod tests {
         assert_eq!(session.uncommitted_events().len(), 2);
         assert_eq!(session.uncommitted_events()[0].event_type(), "card.played");
         assert_eq!(session.uncommitted_events()[1].event_type(), "heat.raised");
+    }
+
+    // play_card must DEDUCT Juice from state (it previously only emitted the spend).
+    #[test]
+    fn play_card_deducts_juice() {
+        let mut session = valid_session();
+        let mut a = OutfitConfig::new("m-1-a");
+        a.max_juice = 5;
+        a.available_juice = 5;
+        session.configure_player_a(a);
+        session.set_opening_player(Some(Player::A));
+
+        session
+            .execute(PlayCard::new("m-1", "m-1-a", "card-instance-1", "boss:B", 3).into_command())
+            .expect("a cost-3 card is affordable at 5 Juice");
+
+        assert_eq!(session.outfit_at(Player::A).available_juice, 2, "5 - 3 = 2");
+    }
+
+    // play_card must PERSIST the Heat raise to state (previously only in the event).
+    #[test]
+    fn play_card_persists_heat() {
+        let mut session = valid_session();
+        let mut a = OutfitConfig::new("m-1-a");
+        a.starting_heat = 0;
+        a.max_juice = 5;
+        a.available_juice = 5;
+        session.configure_player_a(a);
+        session.set_opening_player(Some(Player::A));
+
+        session
+            .execute(PlayCard::new("m-1", "m-1-a", "card-instance-1", "boss:B", 1).into_command())
+            .expect("play succeeds");
+
+        assert_eq!(
+            session.outfit_at(Player::A).starting_heat,
+            1,
+            "Heat 0 -> 1 persisted to state"
+        );
+    }
+
+    // A REJECTED play must leave available_juice unchanged (no partial mutation).
+    #[test]
+    fn play_card_rejection_leaves_juice_unchanged() {
+        let mut session = valid_session();
+        let mut a = OutfitConfig::new("m-1-a");
+        a.max_juice = 3;
+        a.available_juice = 3;
+        session.configure_player_a(a);
+        session.set_opening_player(Some(Player::A));
+
+        let _ = session
+            .execute(PlayCard::new("m-1", "m-1-a", "card-instance-1", "boss:B", 4).into_command())
+            .expect_err("cost 4 > available 3 is rejected");
+
+        assert_eq!(
+            session.outfit_at(Player::A).available_juice,
+            3,
+            "rejected play must not deduct"
+        );
     }
 
     // Scenario: rejected — a card may only be played when its Juice cost does not
@@ -3083,14 +3169,20 @@ mod tests {
     fn end_turn_ramps_incoming_juice_capped_at_the_hard_cap() {
         let mut session = valid_session();
         let mut outfit = OutfitConfig::new("m-1-b");
-        outfit.available_juice = JUICE_CAP; // Already at the cap; ramping cannot exceed it.
+        // Crystal already at the cap; growing it cannot exceed the cap. (The
+        // crystal, not the spent-down pool, is what ramps — see grown_crystal.)
+        outfit.max_juice = JUICE_CAP;
+        outfit.available_juice = JUICE_CAP;
         session.configure_player_b(outfit);
 
         let events = session
             .execute(valid_end_turn().into_command())
             .expect("ending the turn should succeed");
         match &events[1] {
-            Event::TurnEnded(ended) => assert_eq!(ended.next_player_juice, JUICE_CAP),
+            Event::TurnEnded(ended) => {
+                assert_eq!(ended.next_player_max_juice, JUICE_CAP);
+                assert_eq!(ended.next_player_juice, JUICE_CAP);
+            }
             other => panic!("expected TurnEnded, got {other:?}"),
         }
     }
@@ -3122,6 +3214,42 @@ mod tests {
             .expect_err("available Juice over the hard cap must be rejected");
         assert!(matches!(err, DomainError::InvariantViolation(_)));
         assert_eq!(session.version(), 0);
+    }
+
+    // Regression: the pin-at-1 Juice bug. A seat that emptied its pool must
+    // refill to its GROWN crystal next turn, not to `spent + 1`.
+    #[test]
+    fn end_turn_grows_incoming_crystal_and_refills_available() {
+        let mut session = valid_session();
+        // Seat A is opening; seat B (incoming) has a mid-game crystal of 3 but an
+        // emptied pool (spent to 0 last turn).
+        let mut b = OutfitConfig::new("m-1-b");
+        b.max_juice = 3;
+        b.available_juice = 0;
+        session.configure_player_b(b);
+        session.set_opening_player(Some(Player::A));
+
+        let events = session
+            .execute(EndTurn::new("m-1", "m-1-a").into_command())
+            .expect("A may end its turn");
+
+        // Find the TurnEnded event and assert the crystal grew to 4 and available
+        // refilled to the crystal (4), NOT to 1.
+        let ended = events
+            .iter()
+            .find_map(|e| match e {
+                Event::TurnEnded(t) => Some(t),
+                _ => None,
+            })
+            .expect("end_turn emits TurnEnded");
+        assert_eq!(ended.next_player_max_juice, 4, "crystal grows 3 -> 4");
+        assert_eq!(
+            ended.next_player_juice, 4,
+            "available refills to the grown crystal, not to 1"
+        );
+        // State was mutated on the incoming seat.
+        assert_eq!(session.outfit_at(Player::B).max_juice, 4);
+        assert_eq!(session.outfit_at(Player::B).available_juice, 4);
     }
 
     // Scenario: rejected — a board may hold at most 7 Operators and 3 Vehicles.
