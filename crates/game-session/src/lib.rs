@@ -114,6 +114,13 @@ pub const MAX_OPERATORS: usize = 7;
 /// A player's board may hold at most this many Vehicles simultaneously.
 pub const MAX_VEHICLES: usize = 3;
 
+/// Damage a Drive-By summon strafes at the enemy Boss on arrival. The client
+/// keys Drive-By off the card's `amount` field (2 for Stolen Whip,
+/// web/src/match/rules.ts:61/313), which [`CardEffect::Summon`] does not carry;
+/// for Subsystem 1 the only Drive-By card uses 2, so a fixed constant matches.
+/// Subsystem 2 makes it data-driven when the keyword catalog grows.
+pub const DRIVE_BY_DAMAGE: u8 = 2;
+
 /// Cards dealt to each seat's opening hand at match start (matches the client's
 /// `OPENING_HAND`, web/src/match/rules.ts:68).
 pub const OPENING_HAND: usize = 4;
@@ -765,6 +772,20 @@ pub struct OperatorExhausted {
     pub instance_id: String,
 }
 
+/// A unit put on the board by a Summon effect, carried by
+/// [`Event::OperatorSummoned`] and thus by the emitted `operator.summoned`
+/// event. Mirrors the client's summon fold (web/src/match/model.ts:232). The
+/// summoned unit arrives unready (`ready: false`, summoning sickness).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OperatorSummoned {
+    /// The match the unit was summoned in.
+    pub match_id: String,
+    /// The seat that summoned the unit.
+    pub player: Player,
+    /// The unit placed on the board (unready the turn it arrives).
+    pub unit: BoardUnit,
+}
+
 /// An activated Boss hero power, carried by [`Event::HeroPowerActivated`] and
 /// thus by the emitted `hero_power.activated` event.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -885,6 +906,8 @@ pub enum Event {
     BossDamaged(BossDamaged),
     /// A board unit spent its attack and is exhausted for the turn.
     OperatorExhausted(OperatorExhausted),
+    /// A Summon effect put an unready unit on the acting seat's board.
+    OperatorSummoned(OperatorSummoned),
     /// A Boss trademark hero power passed every invariant, was paid for, and
     /// was activated.
     HeroPowerActivated(HeroPowerActivated),
@@ -912,6 +935,7 @@ impl DomainEvent for Event {
             Event::OperatorDied(_) => "operator.died",
             Event::BossDamaged(_) => "boss.damaged",
             Event::OperatorExhausted(_) => "operator.exhausted",
+            Event::OperatorSummoned(_) => "operator.summoned",
             Event::HeroPowerActivated(_) => "hero_power.activated",
             Event::FatigueDamageDealt(_) => "fatigue.damage.dealt",
             Event::TurnEnded(_) => "turn.ended",
@@ -1617,6 +1641,33 @@ impl GameSession {
             )));
         }
 
+        // Find the played instance in the acting seat's hand; its cost is
+        // authoritative. Absent → the card is not in that hand.
+        let instance = self
+            .seat_state_at(seat)
+            .hand
+            .iter()
+            .find(|c| c.instance_id == cmd.card_instance_id)
+            .cloned()
+            .ok_or_else(|| {
+                DomainError::InvariantViolation(format!(
+                    "card '{}' is not in {seat:?}'s hand",
+                    cmd.card_instance_id
+                ))
+            })?;
+        // Anti-cheat: the client cannot understate (or overstate) the cost.
+        if cmd.juice_cost != instance.cost {
+            return Err(DomainError::InvariantViolation(format!(
+                "declared cost {} does not match card cost {}",
+                cmd.juice_cost, instance.cost
+            )));
+        }
+        // Board-cap pre-check for summons, before mutating anything (a rejected
+        // play must leave state untouched).
+        if matches!(instance.effect, CardEffect::Summon) {
+            self.ensure_summon_capacity(seat, instance.card_type)?;
+        }
+
         // Pay the card's Juice cost, and compute the Heat the play raises.
         self.ensure_card_affordable(seat, cmd.juice_cost)?;
         let new_heat = self.heat_after_play(seat)?;
@@ -1628,6 +1679,10 @@ impl GameSession {
             outfit.available_juice -= cmd.juice_cost;
             outfit.starting_heat = new_heat;
         }
+
+        // The card's target, kept for effect resolution after the command's
+        // owned fields are moved into the CardPlayed event below.
+        let target_ref = cmd.target_ref.clone();
 
         // A successful play emits the card first, then the Heat it raised.
         let played = Event::CardPlayed(CardPlayed {
@@ -1646,7 +1701,153 @@ impl GameSession {
         });
         self.root.record(Box::new(played.clone()));
         self.root.record(Box::new(raised.clone()));
-        Ok(vec![played, raised])
+
+        // Remove the played card from hand, then resolve its effect against
+        // state, recording each effect delta after CardPlayed/HeatRaised.
+        self.seat_state_at_mut(seat)
+            .hand
+            .retain(|c| c.instance_id != instance.instance_id);
+        let mut effect_events = self.resolve_effect(seat, &instance, &target_ref);
+        for e in &effect_events {
+            self.root.record(Box::new(e.clone()));
+        }
+        let mut all = vec![played, raised];
+        all.append(&mut effect_events);
+        Ok(all)
+    }
+
+    /// Summon-capacity invariant: a seat's board may hold at most
+    /// [`MAX_OPERATORS`] Operators and [`MAX_VEHICLES`] Vehicles simultaneously.
+    /// Checked against the *live* board before a Summon mutates it, so a rejected
+    /// summon leaves state untouched.
+    fn ensure_summon_capacity(&self, seat: Player, card_type: CardType) -> Result<(), DomainError> {
+        let is_vehicle = matches!(card_type, CardType::Vehicle);
+        let count = self
+            .seat_state_at(seat)
+            .board
+            .iter()
+            .filter(|u| u.is_vehicle == is_vehicle)
+            .count();
+        let cap = if is_vehicle { MAX_VEHICLES } else { MAX_OPERATORS };
+        if count >= cap {
+            return Err(DomainError::InvariantViolation(format!(
+                "{seat:?}'s board is at the {} cap of {cap}",
+                if is_vehicle { "Vehicle" } else { "Operator" }
+            )));
+        }
+        Ok(())
+    }
+
+    /// Reduce `foe`'s Boss HP by `amount` (clamped at 0), emitting
+    /// [`Event::BossDamaged`] and, at 0, [`Event::BossDefeated`] (winner is
+    /// `foe`'s opponent). Mirrors the terminal Boss handling in `declare_attack`.
+    fn damage_boss(&mut self, foe: Player, amount: i32) -> Vec<Event> {
+        let mid = self.match_id.clone();
+        let new_hp = {
+            let outfit = self.outfit_at_mut(foe);
+            outfit.boss_hp -= amount;
+            let clamped = outfit.boss_hp.max(0);
+            outfit.boss_hp = clamped;
+            clamped
+        };
+        let mut out = vec![Event::BossDamaged(BossDamaged {
+            match_id: mid.clone(),
+            player: foe,
+            amount,
+            new_hp,
+        })];
+        if new_hp == 0 {
+            out.push(Event::BossDefeated(BossDefeated {
+                match_id: mid,
+                defeated_player_id: self.outfit_at(foe).name.clone(),
+                defeated_player: foe,
+                boss_id: self.outfit_at(foe).boss_name.clone(),
+                winner: Self::opponent_of(foe),
+            }));
+        }
+        out
+    }
+
+    /// Resolve a `DealDamage` target reference: `"op:<instance_id>"` damages an
+    /// enemy board unit (reusing [`apply_unit_damage`](Self::apply_unit_damage)),
+    /// anything else (`"boss:<seat>"`) damages the enemy Boss.
+    fn damage_target(&mut self, target_ref: &str, amount: u8, foe: Player) -> Vec<Event> {
+        if let Some(id) = target_ref.strip_prefix("op:") {
+            self.apply_unit_damage(foe, id, amount)
+        } else {
+            self.damage_boss(foe, amount as i32)
+        }
+    }
+
+    /// Draw the top card of `seat`'s ordered deck into its hand, returning it.
+    /// `None` when the deck is empty (a real draw would deal Fatigue instead;
+    /// modeled by the start-of-turn draw, not by card effects).
+    fn draw_one(&mut self, seat: Player) -> Option<CardInstance> {
+        let st = self.seat_state_at_mut(seat);
+        if st.deck.is_empty() {
+            return None;
+        }
+        let card = st.deck.remove(0);
+        st.hand.push(card.clone());
+        Some(card)
+    }
+
+    /// Port of the client's `resolveEffect` (web/src/match/rules.ts:299): mutate
+    /// state for `card`'s [`CardEffect`] and return the deltas the client folds.
+    /// Summon puts an unready [`BoardUnit`] on `seat`'s board (firing Drive-By at
+    /// the enemy Boss on arrival); DealDamage hits the target; GainJuice/Cool
+    /// adjust resources; DrawCards pulls from the deck.
+    fn resolve_effect(&mut self, seat: Player, card: &CardInstance, target_ref: &str) -> Vec<Event> {
+        let foe = Self::opponent_of(seat);
+        let mid = self.match_id.clone();
+        let mut out = Vec::new();
+        match card.effect {
+            CardEffect::None => {}
+            CardEffect::DealDamage { amount } => {
+                let tref = if target_ref.is_empty() {
+                    format!("boss:{foe:?}")
+                } else {
+                    target_ref.to_string()
+                };
+                out.extend(self.damage_target(&tref, amount, foe));
+            }
+            CardEffect::Summon => {
+                let unit = BoardUnit {
+                    instance_id: card.instance_id.clone(),
+                    card_id: card.card_id.clone(),
+                    atk: card.atk,
+                    hp: card.hp,
+                    max_hp: card.hp,
+                    ready: false,
+                    is_vehicle: matches!(card.card_type, CardType::Vehicle),
+                    keywords: card.keywords.clone(),
+                };
+                self.seat_state_at_mut(seat).board.push(unit.clone());
+                out.push(Event::OperatorSummoned(OperatorSummoned {
+                    match_id: mid,
+                    player: seat,
+                    unit,
+                }));
+                // Drive-By: strafe the enemy Boss on arrival.
+                if card.keywords.contains(&Keyword::DriveBy) {
+                    out.extend(self.damage_boss(foe, DRIVE_BY_DAMAGE as i32));
+                }
+            }
+            CardEffect::DrawCards { amount } => {
+                for _ in 0..amount {
+                    let _ = self.draw_one(seat);
+                }
+            }
+            CardEffect::GainJuice { amount } => {
+                let o = self.outfit_at_mut(seat);
+                o.available_juice = o.available_juice.saturating_add(amount).min(JUICE_CAP);
+            }
+            CardEffect::Cool { amount } => {
+                let o = self.outfit_at_mut(seat);
+                o.starting_heat = (o.starting_heat - amount as i32).max(*HEAT_BOUNDS.start());
+            }
+        }
+        out
     }
 
     /// Handle `AttackCmd`: verify the command targets this match and a real
@@ -2808,11 +3009,178 @@ mod tests {
         PlayCard::new("m-1", "m-1-a", "card-instance-1", "target-1", 2)
     }
 
+    /// A session `m-1` opened cleanly with player `A` to move, both seats dealt
+    /// their seeded opening hands. Effect tests push a *known* card into `A`'s
+    /// hand and set `A`'s Juice before playing it.
+    fn seated_match() -> GameSession {
+        let mut session = GameSession::new("m-1");
+        session.set_opening_player(Some(Player::A));
+        session
+            .execute(StartMatch::new("m-1", "m-1-a", "m-1-b", 0xC0FFEE).into_command())
+            .expect("a default opening starts cleanly");
+        session
+    }
+
+    /// Set `seat`'s Juice crystal and available pool to `n` (so it can afford a
+    /// card costing up to `n`).
+    fn give_juice(session: &mut GameSession, seat: Player, n: u8) {
+        let outfit = session.outfit_at_mut(seat);
+        outfit.max_juice = n;
+        outfit.available_juice = n;
+    }
+
+    /// Build a hand card instance with explicit play-stats for effect tests.
+    fn test_card_instance(
+        id: &str,
+        cost: u8,
+        card_type: CardType,
+        effect: CardEffect,
+        atk: u8,
+        hp: u8,
+        kws: &[Keyword],
+    ) -> CardInstance {
+        CardInstance {
+            instance_id: id.to_string(),
+            card_id: "test".to_string(),
+            cost,
+            card_type,
+            effect,
+            atk,
+            hp,
+            keywords: kws.to_vec(),
+            boss_lock: None,
+        }
+    }
+
+    #[test]
+    fn play_summon_card_puts_unit_on_board_unready() {
+        let mut session = seated_match();
+        // Put a known summon card in A's hand: a 3/2 Operator, cost 2, Summon.
+        session.seat_state_at_mut(Player::A).hand.push(test_card_instance(
+            "A-homie-0",
+            2,
+            CardType::Operator,
+            CardEffect::Summon,
+            3,
+            2,
+            &[],
+        ));
+        give_juice(&mut session, Player::A, 5);
+
+        let events = session
+            .execute(PlayCard::new("m-1", "m-1-a", "A-homie-0", "boss:B", 2).into_command())
+            .expect("summon is affordable");
+
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, Event::OperatorSummoned(s) if s.unit.instance_id == "A-homie-0" && !s.unit.ready)));
+        assert!(session
+            .seat_state_at(Player::A)
+            .board
+            .iter()
+            .any(|u| u.instance_id == "A-homie-0"));
+        assert!(
+            session
+                .seat_state_at(Player::A)
+                .hand
+                .iter()
+                .all(|c| c.instance_id != "A-homie-0"),
+            "card leaves hand"
+        );
+    }
+
+    #[test]
+    fn play_damage_card_hits_the_boss() {
+        let mut session = seated_match();
+        session.seat_state_at_mut(Player::A).hand.push(test_card_instance(
+            "A-bolt-0",
+            1,
+            CardType::Job,
+            CardEffect::DealDamage { amount: 3 },
+            0,
+            0,
+            &[],
+        ));
+        give_juice(&mut session, Player::A, 5);
+        let mut b = OutfitConfig::new("m-1-b");
+        b.boss_hp = 10;
+        session.configure_player_b(b);
+
+        session
+            .execute(PlayCard::new("m-1", "m-1-a", "A-bolt-0", "boss:B", 1).into_command())
+            .unwrap();
+        assert_eq!(session.outfit_at(Player::B).boss_hp, 7, "10 - 3");
+    }
+
+    #[test]
+    fn play_driveby_summon_also_hits_enemy_boss() {
+        let mut session = seated_match();
+        // Stolen Whip: 4/3 Vehicle, Drive-By amount 2.
+        session.seat_state_at_mut(Player::A).hand.push(test_card_instance(
+            "A-whip-0",
+            3,
+            CardType::Vehicle,
+            CardEffect::Summon,
+            4,
+            3,
+            &[Keyword::DriveBy],
+        ));
+        give_juice(&mut session, Player::A, 5);
+        let mut b = OutfitConfig::new("m-1-b");
+        b.boss_hp = 10;
+        session.configure_player_b(b);
+
+        session
+            .execute(PlayCard::new("m-1", "m-1-a", "A-whip-0", "boss:B", 3).into_command())
+            .unwrap();
+        assert_eq!(
+            session.outfit_at(Player::B).boss_hp,
+            8,
+            "Drive-By strafes 2 on arrival"
+        );
+    }
+
+    #[test]
+    fn summon_rejected_when_operator_board_full() {
+        let mut session = seated_match();
+        for i in 0..MAX_OPERATORS {
+            session
+                .seat_state_at_mut(Player::A)
+                .board
+                .push(test_unit(&format!("A-op-{i}"), 1, 1, true, false, &[]));
+        }
+        session.seat_state_at_mut(Player::A).hand.push(test_card_instance(
+            "A-homie-0",
+            2,
+            CardType::Operator,
+            CardEffect::Summon,
+            3,
+            2,
+            &[],
+        ));
+        give_juice(&mut session, Player::A, 5);
+        let err = session
+            .execute(PlayCard::new("m-1", "m-1-a", "A-homie-0", "boss:B", 2).into_command())
+            .expect_err("board full");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+    }
+
     // Scenario: Successfully execute PlayCardCmd — a card.played event and a
     // heat.raised event are emitted.
     #[test]
     fn plays_card_and_emits_card_played_and_heat_raised_events() {
         let mut session = valid_session();
+        // Seat the played instance in A's hand with a no-op effect, so only the
+        // card.played + heat.raised deltas are emitted (no effect deltas).
+        session.seat_state_at_mut(Player::A).hand.push(test_card_instance(
+            "card-instance-1",
+            2,
+            CardType::Job,
+            CardEffect::None,
+            0,
+            0,
+            &[],
+        ));
 
         let events = session
             .execute(valid_play_card().into_command())
@@ -2858,6 +3226,15 @@ mod tests {
         a.available_juice = 5;
         session.configure_player_a(a);
         session.set_opening_player(Some(Player::A));
+        session.seat_state_at_mut(Player::A).hand.push(test_card_instance(
+            "card-instance-1",
+            3,
+            CardType::Job,
+            CardEffect::None,
+            0,
+            0,
+            &[],
+        ));
 
         session
             .execute(PlayCard::new("m-1", "m-1-a", "card-instance-1", "boss:B", 3).into_command())
@@ -2876,6 +3253,15 @@ mod tests {
         a.available_juice = 5;
         session.configure_player_a(a);
         session.set_opening_player(Some(Player::A));
+        session.seat_state_at_mut(Player::A).hand.push(test_card_instance(
+            "card-instance-1",
+            1,
+            CardType::Job,
+            CardEffect::None,
+            0,
+            0,
+            &[],
+        ));
 
         session
             .execute(PlayCard::new("m-1", "m-1-a", "card-instance-1", "boss:B", 1).into_command())
@@ -2897,6 +3283,17 @@ mod tests {
         a.available_juice = 3;
         session.configure_player_a(a);
         session.set_opening_player(Some(Player::A));
+        // Seat the played instance so the rejection is the affordability check
+        // (cost 4 > available 3), proving that rejection mutates no Juice.
+        session.seat_state_at_mut(Player::A).hand.push(test_card_instance(
+            "card-instance-1",
+            4,
+            CardType::Job,
+            CardEffect::None,
+            0,
+            0,
+            &[],
+        ));
 
         let _ = session
             .execute(PlayCard::new("m-1", "m-1-a", "card-instance-1", "boss:B", 4).into_command())
@@ -2915,6 +3312,15 @@ mod tests {
     fn play_card_rejects_when_cost_exceeds_available_juice() {
         let mut session = valid_session();
         // Default available Juice is 3; a cost of 4 cannot be afforded.
+        session.seat_state_at_mut(Player::A).hand.push(test_card_instance(
+            "card-instance-1",
+            4,
+            CardType::Job,
+            CardEffect::None,
+            0,
+            0,
+            &[],
+        ));
         let err = session
             .execute(PlayCard::new("m-1", "m-1-a", "card-instance-1", "target-1", 4).into_command())
             .expect_err("a card the player cannot afford must be rejected");

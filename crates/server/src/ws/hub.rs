@@ -29,7 +29,7 @@ use std::sync::Mutex;
 use tokio::sync::broadcast;
 
 use domain::match_replay::MatchReplay;
-use game_session::{Event, GameSession, Player, ResolveCopEvent};
+use game_session::{Event, GameSession, Keyword, Player, ResolveCopEvent};
 use mocks::InMemoryMatchReplayRepository;
 use shared::{Aggregate, Command, DomainEvent, Repository};
 
@@ -515,6 +515,23 @@ fn delta_event_json(event: &Event) -> serde_json::Value {
             "matchId": e.match_id,
             "player": player_tag(e.player),
             "instanceId": e.instance_id,
+        }),
+        Event::OperatorSummoned(e) => json!({
+            "matchId": e.match_id,
+            "player": player_tag(e.player),
+            "unit": {
+                "instanceId": e.unit.instance_id,
+                "cardId": e.unit.card_id,
+                "atk": e.unit.atk,
+                "hp": e.unit.hp,
+                "maxHp": e.unit.max_hp,
+                "ready": e.unit.ready,
+                "isVehicle": e.unit.is_vehicle,
+                "keywords": e.unit.keywords.iter().map(|k| match k {
+                    Keyword::Spotlight => "Spotlight",
+                    Keyword::DriveBy => "Drive-By",
+                }).collect::<Vec<_>>(),
+            },
         }),
         Event::HeroPowerActivated(e) => json!({
             "matchId": e.match_id,
