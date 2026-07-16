@@ -1438,22 +1438,23 @@ impl GameSession {
     /// Since a deck backs a tradeable asset, this is re-checked here even
     /// though the Outfit aggregate already enforces the same rule at
     /// deck-build time — a client cannot be trusted to have gone through it.
-    fn ensure_boss_locks_honored(&self) -> Result<(), DomainError> {
-        for seat in [Player::A, Player::B] {
-            let boss = self.outfit_at(seat).boss_name.clone();
-            for c in self
-                .seat_state_at(seat)
-                .deck
-                .iter()
-                .chain(self.seat_state_at(seat).hand.iter())
-            {
-                if let Some(b) = &c.boss_lock {
-                    if b != &boss {
-                        return Err(DomainError::InvariantViolation(format!(
-                            "seat {seat:?} decks card '{}' locked to Boss '{b}', but its Boss is '{boss}'",
-                            c.card_id
-                        )));
-                    }
+    ///
+    /// Takes `seat`/`boss`/`cards` as plain values rather than reading
+    /// `self.seat_a`/`self.seat_b` so callers can validate a *locally built*
+    /// deal before committing it to seat state — a rejected command must
+    /// mutate nothing (see `start_match`).
+    fn ensure_boss_locks_honored<'a>(
+        seat: Player,
+        boss: &str,
+        cards: impl Iterator<Item = &'a CardInstance>,
+    ) -> Result<(), DomainError> {
+        for c in cards {
+            if let Some(b) = &c.boss_lock {
+                if b != boss {
+                    return Err(DomainError::InvariantViolation(format!(
+                        "seat {seat:?} decks card '{}' locked to Boss '{b}', but its Boss is '{boss}'",
+                        c.card_id
+                    )));
                 }
             }
         }
@@ -1515,24 +1516,36 @@ impl GameSession {
         self.ensure_bosses_alive()?;
         let opening_player = self.ensure_opening_player_designated()?;
 
-        // Deal both seats from the seeded 30-card deck: the opening hand is the
-        // first OPENING_HAND cards, the rest stays as the ordered secret deck.
-        // build_deck ports the client's mulberry32/buildDeck so a WASM-predicted
-        // deal matches this one bit-for-bit.
+        // Deal both seats from the seeded 30-card deck into LOCAL variables
+        // first: the opening hand is the first OPENING_HAND cards, the rest
+        // stays as the ordered secret deck. build_deck ports the client's
+        // mulberry32/buildDeck so a WASM-predicted deal matches this one
+        // bit-for-bit.
+        //
+        // The boss-lock backstop (Task 8, server-authoritative anti-cheat:
+        // decks back tradeable assets) is validated against these locals
+        // BEFORE any write to `self.seat_a`/`self.seat_b` — a rejected
+        // command must mutate nothing, and this session is a long-lived
+        // in-memory aggregate (see `crates/server/src/ws/hub.rs`), not
+        // discarded on `Err`.
         let seed = cmd.rng_seed;
+        let mut dealt: Vec<(Player, Vec<CardInstance>, Vec<CardInstance>)> = Vec::new();
         for seat in [Player::A, Player::B] {
             let mut deck = build_deck(seed, seat);
             let hand: Vec<CardInstance> = deck.drain(0..OPENING_HAND.min(deck.len())).collect();
+            let boss = self.outfit_at(seat).boss_name.clone();
+            Self::ensure_boss_locks_honored(seat, &boss, deck.iter().chain(hand.iter()))?;
+            dealt.push((seat, deck, hand));
+        }
+
+        // Both seats validated cleanly: only now is it safe to commit the
+        // deal to live seat state.
+        for (seat, deck, hand) in dealt {
             let st = self.seat_state_at_mut(seat);
             st.hand = hand;
             st.deck = deck;
             st.board = Vec::new();
         }
-
-        // Server-authoritative anti-cheat backstop: re-validate every dealt
-        // card's boss lock against the seat's actual Boss, since decks back
-        // tradeable assets (Task 8).
-        self.ensure_boss_locks_honored()?;
 
         let event = Event::MatchStarted(MatchStarted {
             match_id: cmd.match_id,
@@ -2864,16 +2877,17 @@ mod tests {
     // Scenario: StartMatch's server-authoritative anti-cheat backstop rejects a
     // dealt card locked to a Boss other than the seat's own (Task 8). The
     // ported CARD_POOL never carries a boss lock, so a legitimate deal can
-    // never trip this check through the public StartMatchCmd path alone; this
-    // seeds a seat's deck with a mismatched-lock card and calls the exact
-    // validation `start_match` runs (`ensure_boss_locks_honored`) directly —
-    // the same private method invoked at the end of `start_match`.
+    // never trip this check through the public StartMatchCmd path alone;
+    // this calls `ensure_boss_locks_honored` directly — the exact,
+    // now-parameterized validation `start_match` runs against its LOCAL
+    // deal (deck/hand built but not yet written into `self.seat_a`/
+    // `self.seat_b`) before it commits anything to seat state.
     #[test]
     fn start_match_rejects_mismatched_boss_lock() {
-        let mut session = valid_session();
+        let session = valid_session();
         // OutfitConfig::new gives player A's Boss the name "m-1-a-boss".
         assert_eq!(session.outfit_at(Player::A).boss_name, "m-1-a-boss");
-        session.seat_state_at_mut(Player::A).deck.push(CardInstance {
+        let mismatched = CardInstance {
             instance_id: "A-locked-0".to_string(),
             card_id: "boss-card".to_string(),
             cost: 0,
@@ -2883,23 +2897,37 @@ mod tests {
             hp: 0,
             keywords: vec![],
             boss_lock: Some("some-other-boss".to_string()),
-        });
+        };
 
-        let err = session
-            .ensure_boss_locks_honored()
-            .expect_err("a card locked to a mismatched Boss must be rejected");
+        let err = GameSession::ensure_boss_locks_honored(
+            Player::A,
+            "m-1-a-boss",
+            std::iter::once(&mismatched),
+        )
+        .expect_err("a card locked to a mismatched Boss must be rejected");
         assert!(matches!(err, DomainError::InvariantViolation(_)));
     }
 
     // Scenario: a legitimately dealt match (no boss-locked cards) passes the
-    // boss-lock backstop cleanly.
+    // boss-lock backstop cleanly, both through the public execute() path and
+    // when the same check is re-run directly against the resulting seat
+    // state.
     #[test]
     fn start_match_accepts_deal_with_no_boss_locked_cards() {
         let mut session = valid_session();
         session
             .execute(valid_cmd().into_command())
             .expect("a legitimate deal carries no boss-locked cards");
-        assert!(session.ensure_boss_locks_honored().is_ok());
+        for seat in [Player::A, Player::B] {
+            let boss = session.outfit_at(seat).boss_name.clone();
+            let st = session.seat_state_at(seat);
+            assert!(GameSession::ensure_boss_locks_honored(
+                seat,
+                &boss,
+                st.deck.iter().chain(st.hand.iter())
+            )
+            .is_ok());
+        }
     }
 
     // The Rust mulberry32 port must reproduce the client's JS PRNG bit-for-bit,
