@@ -228,6 +228,7 @@ export type DeltaEvent =
   | { readonly type: 'hero_power.activated'; readonly player: Seat; readonly targetRef: string; readonly juiceSpent: number; readonly remainingJuice: number }
   | { readonly type: 'card.drawn'; readonly player: Seat; readonly card: HandCard }
   | { readonly type: 'boss.damaged'; readonly player: Seat; readonly amount: number; readonly newHp: number }
+  | { readonly type: 'boss.armor.gained'; readonly player: Seat; readonly amount: number; readonly newHp: number }
   | { readonly type: 'juice.gained'; readonly player: Seat; readonly amount: number; readonly newJuice: number }
   | { readonly type: 'operator.summoned'; readonly player: Seat; readonly unit: BoardUnit }
   | { readonly type: 'operator.damaged'; readonly player: Seat; readonly instanceId: string; readonly newHp: number }

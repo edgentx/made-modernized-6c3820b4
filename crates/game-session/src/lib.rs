@@ -2738,22 +2738,79 @@ pub trait GameSessionRepository: Repository<GameSession> {}
 #[cfg(feature = "wasm")]
 mod wasm_bindings {
     use super::GameSession;
-    use shared::{Aggregate, Command};
+    use shared::{Aggregate, Command, DomainEvent};
     use wasm_bindgen::prelude::*;
 
-    /// Run a command against a fresh `GameSession` from the browser client.
+    /// A stateful `GameSession` handle the browser client drives across commands.
     ///
-    /// Returns `Ok(())` when the command is applied, or the domain error text
-    /// (e.g. the `UnknownCommand` message, or an invariant violation) as a
-    /// `JsValue` — mirroring exactly what the authoritative server would decide
-    /// for the same input.
+    /// Unlike the old payload-less `execute_command` (which spun up a *fresh empty*
+    /// session and ran a bare-named command that could never exercise real rules),
+    /// this threads a JSON payload through [`GameSession::execute`] against retained
+    /// state — a real client-side prediction engine that reaches the identical
+    /// verdict the authoritative server's `apply_action` reaches for the same input.
     #[wasm_bindgen]
-    pub fn execute_command(session_id: String, command_name: String) -> Result<(), JsValue> {
-        let mut session = GameSession::new(session_id);
-        session
-            .execute(Command::new(command_name))
-            .map(|_events| ())
-            .map_err(|err| JsValue::from_str(&err.to_string()))
+    pub struct WasmGameSession(GameSession);
+
+    #[wasm_bindgen]
+    impl WasmGameSession {
+        /// Open a fresh session for `match_id`, mirroring the server's match.
+        #[wasm_bindgen(constructor)]
+        pub fn new(match_id: String) -> WasmGameSession {
+            WasmGameSession(GameSession::new(match_id))
+        }
+
+        /// Run a command by name with a JSON payload; returns the emitted
+        /// event-type sequence as JSON on success (the prediction), or the
+        /// domain-error text on rejection — the same decision the server's
+        /// `apply_action` makes for the same input.
+        pub fn execute(
+            &mut self,
+            command_name: String,
+            payload_json: String,
+        ) -> Result<JsValue, JsValue> {
+            let payload = payload_json.into_bytes();
+            match self.0.execute(Command::with_payload(command_name, payload)) {
+                Ok(events) => {
+                    let types: Vec<&'static str> = events.iter().map(|e| e.event_type()).collect();
+                    serde_wasm_bindgen::to_value(&types)
+                        .map_err(|e| JsValue::from_str(&e.to_string()))
+                }
+                Err(err) => Err(JsValue::from_str(&err.to_string())),
+            }
+        }
+    }
+}
+
+/// WASM parity gate: a `WasmGameSession` run and a native `GameSession` run of
+/// the *same* command must emit the *same* event-type sequence, proving the
+/// browser prediction engine and the authoritative server agree at the event
+/// level. `target_arch = "wasm32"`-gated so it compiles out of the native suite;
+/// run it with `wasm-pack test --node crates/game-session -- --features wasm`.
+#[cfg(all(test, target_arch = "wasm32"))]
+mod wasm_tests {
+    use super::wasm_bindings::WasmGameSession;
+    use super::{GameSession, StartMatch};
+    use shared::{Aggregate, DomainEvent};
+    use wasm_bindgen_test::*;
+
+    #[wasm_bindgen_test]
+    fn wasm_start_and_play_matches_native() {
+        let start = StartMatch::new("m-1", "m-1-a", "m-1-b", 0xC0FFEE);
+
+        // Native run of a representative command.
+        let mut native = GameSession::new("m-1");
+        let native_events = native.execute(start.into_command()).unwrap();
+        let native_types: Vec<&'static str> =
+            native_events.iter().map(|e| e.event_type()).collect();
+
+        // WASM run of the SAME command via the browser binding.
+        let start_json = serde_json::to_string(&start).unwrap();
+        let mut wasm = WasmGameSession::new("m-1".into());
+        let wasm_result = wasm.execute("StartMatchCmd".into(), start_json).unwrap();
+        let wasm_types: Vec<String> = serde_wasm_bindgen::from_value(wasm_result).unwrap();
+
+        // Prediction == authority at the event-sequence level.
+        assert_eq!(native_types, wasm_types);
     }
 }
 

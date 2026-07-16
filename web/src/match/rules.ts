@@ -368,6 +368,11 @@ export function foldEvent(state: MatchState, event: DeltaEvent): MatchState {
       return patchSeat(state, event.player, (s) => ({ ...s, heat: event.newHeat }))
     case 'boss.damaged':
       return patchSeat(state, event.player, (s) => ({ ...s, bossHp: event.newHp }))
+    case 'boss.armor.gained':
+      // GainArmor raises the activating seat's own Boss HP to the authoritative
+      // post-gain value — the mirror of boss.damaged, so an online client folds
+      // it instead of desyncing.
+      return patchSeat(state, event.player, (s) => ({ ...s, bossHp: event.newHp }))
     case 'juice.gained':
       return patchSeat(state, event.player, (s) => ({ ...s, juice: event.newJuice }))
     case 'operator.summoned':

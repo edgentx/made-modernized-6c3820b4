@@ -125,13 +125,15 @@ export function useMatch(matchId = 'live', ticket?: string): MatchController {
           rerender()
         },
       },
+      // The match this connection acts on; rides in every action envelope.
+      matchId,
       // A mission launch joins the AI-opponent's authoritative match via its ticket.
       ticket,
     )
     connection.current = conn
     conn.connect()
     return () => conn.close()
-  }, [mode, ticket, raiseCorrection, rerender])
+  }, [mode, matchId, ticket, raiseCorrection, rerender])
 
   // Canvas renderer + animation loop. Redraws from refs each frame and decays the
   // correction flash; a ResizeObserver keeps the backing store matched to the box.

@@ -37,6 +37,7 @@ export class MatchConnection {
 
   constructor(
     private readonly handlers: ConnectionHandlers,
+    private readonly matchId: string,
     private readonly ticket?: string,
   ) {}
 
@@ -57,15 +58,19 @@ export class MatchConnection {
   }
 
   /**
-   * Forward a player action to the authoritative server. The current server
-   * parses each text frame as a command name, so we send the action's wire
-   * `kind` verbatim; a richer server can decode the same name plus a payload.
-   * Returns `false` when the socket is not open (the caller keeps the prediction
-   * pending and the reconnect/resync path reconciles it).
+   * Forward a player action to the authoritative server as the structured
+   * envelope its `ClientMessage` already parses — `{ type:"action", matchId,
+   * command, payload }` — where `command` is the action's wire `kind` and
+   * `payload` carries the remaining fields (`seat`, `targetRef`, …). This
+   * activates the real online command path; the old bare-`kind` frame arrived
+   * unparseable (no matchId, no payload). Returns `false` when the socket is not
+   * open (the caller keeps the prediction pending and the reconnect/resync path
+   * reconciles it).
    */
   send(action: MatchAction): boolean {
     if (!this.socket || this.socket.readyState !== WebSocket.OPEN) return false
-    this.socket.send(action.kind)
+    const { kind, ...fields } = action
+    this.socket.send(JSON.stringify({ type: 'action', matchId: this.matchId, command: kind, payload: fields }))
     return true
   }
 
