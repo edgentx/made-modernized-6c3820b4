@@ -77,7 +77,7 @@ Add to the test module (near the `end_turn` tests, ~line 3083):
         b.max_juice = 3;
         b.available_juice = 0;
         session.configure_player_b(b);
-        session.set_opening_player(Player::A);
+        session.set_opening_player(Some(Player::A));
 
         let events = session
             .execute(EndTurn::new("m-1", "m-1-a").into_command())
@@ -100,7 +100,7 @@ Add to the test module (near the `end_turn` tests, ~line 3083):
     }
 ```
 
-> Note: `configure_player_b`, `set_opening_player`, `valid_session`, and `Player` are already used throughout the test module (see `play_card_rejects_when_board_exceeds_operator_cap`, lib.rs:2328, and the `end_turn` tests from 3083). If `set_opening_player` is spelled differently in-file (e.g. `configure_opening_player`), match the existing spelling — grep the test module for how the opening player is set.
+> Confirmed signatures (verified against lib.rs): `configure_player_a`/`configure_player_b` (lib.rs:905/910) take an `OutfitConfig`; **`set_opening_player` (lib.rs:916) takes `Option<Player>`** — so pass `Some(Player::A)`, not `Player::A` (every test in this plan does). `valid_session()` and `Player` are used throughout the test module (see `play_card_rejects_when_board_exceeds_operator_cap`, lib.rs:2328).
 
 - [ ] **Step 2: Run it to confirm it fails to compile / fails**
 
@@ -214,7 +214,7 @@ Expected: PASS.
         a.max_juice = 5;
         a.available_juice = 5;
         session.configure_player_a(a);
-        session.set_opening_player(Player::A);
+        session.set_opening_player(Some(Player::A));
 
         session
             .execute(PlayCard::new("m-1", "m-1-a", "card-instance-1", "boss:B", 3).into_command())
@@ -232,7 +232,7 @@ Expected: PASS.
         a.max_juice = 5;
         a.available_juice = 5;
         session.configure_player_a(a);
-        session.set_opening_player(Player::A);
+        session.set_opening_player(Some(Player::A));
 
         session
             .execute(PlayCard::new("m-1", "m-1-a", "card-instance-1", "boss:B", 1).into_command())
@@ -249,7 +249,7 @@ Expected: PASS.
         a.max_juice = 3;
         a.available_juice = 3;
         session.configure_player_a(a);
-        session.set_opening_player(Player::A);
+        session.set_opening_player(Some(Player::A));
 
         let _ = session
             .execute(PlayCard::new("m-1", "m-1-a", "card-instance-1", "boss:B", 4).into_command())
@@ -515,7 +515,7 @@ Add to the `game-session` test module:
     }
 ```
 
-> `game-session` must depend on `domain` to read `REGISTERED_EFFECTS`. Check `crates/game-session/Cargo.toml`: today its deps are `shared` + serde only. Adding `domain` risks a dependency cycle (domain does not depend on game-session today — verify with `cargo tree -p domain | grep game-session`; it should be absent). If adding `domain` is clean, add `domain = { workspace = true }` to `[dependencies]`. If it introduces a cycle or breaks the WASM build, instead **re-declare the effect-name constants privately in game-session** and keep the coverage test inside `domain` (iterating `REGISTERED_EFFECTS` against a `game-session`-independent mapping is not possible across a cycle — prefer the private re-declaration and a comment pointing at the catalog list). Decide based on `cargo tree`; the mapping content is identical either way.
+> `game-session` must depend on `domain` to read `REGISTERED_EFFECTS`. **Confirmed safe:** `crates/domain/Cargo.toml` does NOT depend on `game-session`, so adding `domain = { workspace = true }` to `crates/game-session/Cargo.toml` `[dependencies]` creates no cycle. **WASM caveat:** verify `domain` compiles to `wasm32` (it decodes command payloads with serde like game-session, so it should) — run `cargo build -p game-session --features wasm` after adding the dep. If `domain` unexpectedly pulls a host-only dep into the WASM build, fall back to re-declaring the effect-name constants privately in `game-session` with a comment pointing at `domain::card_definition::REGISTERED_EFFECTS`; the mapping content is identical either way.
 
 - [ ] **Step 3: Run to confirm failure**
 
@@ -826,7 +826,7 @@ pub struct OperatorExhausted { pub match_id: String, pub player: Player, pub ins
     #[test]
     fn attack_unit_is_simultaneous_with_retaliation() {
         let mut session = valid_session();
-        session.set_opening_player(Player::A);
+        session.set_opening_player(Some(Player::A));
         // A attacker 3/2, B defender 2/5.
         session.seat_state_at_mut(Player::A).board.push(test_unit("A-atk", 3, 2, true, false, &[]));
         session.seat_state_at_mut(Player::B).board.push(test_unit("B-def", 2, 5, true, false, &[]));
@@ -844,7 +844,7 @@ pub struct OperatorExhausted { pub match_id: String, pub player: Player, pub ins
     #[test]
     fn attack_boss_reduces_hp_and_ends_match_at_zero() {
         let mut session = valid_session();
-        session.set_opening_player(Player::A);
+        session.set_opening_player(Some(Player::A));
         let mut b = OutfitConfig::new("m-1-b");
         b.boss_hp = 3;
         session.configure_player_b(b);
@@ -855,13 +855,13 @@ pub struct OperatorExhausted { pub match_id: String, pub player: Player, pub ins
             .expect("A attacks B's boss");
 
         assert!(events.iter().any(|e| matches!(e, Event::BossDamaged(d) if d.new_hp == 0)));
-        assert!(events.iter().any(|e| matches!(e, Event::MatchCompleted(_))));
+        assert!(events.iter().any(|e| matches!(e, Event::BossDefeated(d) if d.winner == Player::A)));
     }
 
     #[test]
     fn spotlight_forces_attack_onto_taunt_unit() {
         let mut session = valid_session();
-        session.set_opening_player(Player::A);
+        session.set_opening_player(Some(Player::A));
         session.seat_state_at_mut(Player::A).board.push(test_unit("A-atk", 2, 2, true, false, &[]));
         session.seat_state_at_mut(Player::B).board.push(test_unit("B-taunt", 0, 4, true, false, &[Keyword::Spotlight]));
         // Attacking the boss while a Spotlight unit stands is rejected.
@@ -948,7 +948,18 @@ Rename const value (lib.rs:90) to `"AttackCmd"`, rename `struct DeclareAttack` �
             let new_hp = outfit.boss_hp.max(0);
             events.push(Event::BossDamaged(BossDamaged { match_id: self.match_id.clone(), player: defending_player, amount: attacker_atk as i32, new_hp }));
             if new_hp == 0 {
-                events.push(Event::MatchCompleted(/* winner = seat; mirror the existing MatchCompleted fields */));
+                // Terminal: reuse the existing BossDefeated event (what the old
+                // declare_attack emitted) — MatchCompleted is concession-shaped and
+                // wrong for a combat kill. Fields confirmed against lib.rs:683.
+                let defeated_player_id = self.outfit_at(defending_player).name.clone();
+                let boss_id = self.outfit_at(defending_player).boss_name.clone();
+                events.push(Event::BossDefeated(BossDefeated {
+                    match_id: self.match_id.clone(),
+                    defeated_player_id,
+                    defeated_player: defending_player,
+                    boss_id,
+                    winner: seat,
+                }));
             }
         } else {
             return Err(DomainError::InvariantViolation(format!("malformed targetRef '{}'", cmd.target_ref)));
@@ -993,7 +1004,7 @@ Add the damage helper (returns the deltas and removes dead units):
     }
 ```
 
-> Borrow-checker note: `apply_unit_damage` takes `&mut self` and mutates one seat's board, then reads `self.match_id` — sequence the `&mut board` borrow to end before the `self.match_id.clone()` (as written). The `MatchCompleted` construction must match the existing `MatchCompleted` struct's fields (grep its definition ~777 for the exact field names, e.g. `winner`, `match_id`; the old `declare_attack` built `BossDefeated` — you may keep emitting `BossDefeated` too if the client folds it, but the client's fold set (model.ts:239) uses `match.completed`, so prefer `MatchCompleted`).
+> Borrow-checker note: `apply_unit_damage` takes `&mut self` and mutates one seat's board, then reads `self.match_id` — sequence the `&mut board` borrow to end before the `self.match_id.clone()` (as written). **Terminal event (confirmed):** emit the existing `BossDefeated` (lib.rs:683, fields `{match_id, defeated_player_id, defeated_player, boss_id, winner}`) — the same event the old `declare_attack` emitted. Do NOT use `MatchCompleted`: its shape is concession-specific (`conceding_player_id`/`winning_player_id`, lib.rs:777) and does not model a combat kill. The client not folding `boss.defeated` yet is not a regression (the old code emitted it too); a `boss.defeated` fold is a Subsystem-2 client task.
 
 - [ ] **Step 5: Run the combat tests + full suite**
 
@@ -1191,7 +1202,7 @@ Add `resolve_effect` and `ensure_summon_capacity`:
     }
 ```
 
-> `damage_target`/`damage_boss`/`draw_one` are small helpers: `damage_target` parses `op:`/`boss:` and dispatches to `apply_unit_damage` (Task 5) or `damage_boss`; `damage_boss` reduces `outfit_at_mut(foe).boss_hp`, clamps at 0, emits `BossDamaged`, and appends `MatchCompleted` at 0. `draw_one` pops the front of `seat_state_at_mut(seat).deck` into `hand`. **Drive-By amount:** the client keys Drive-By off the card's `amount` field (2 for Stolen Whip, rules.ts:61/313), which `CardEffect::Summon` does not carry. For Subsystem 1 use a fixed `DRIVE_BY_DAMAGE = 2` constant (matches the only Drive-By card); Subsystem 2 makes it data-driven when the keyword catalog grows. Add `const DRIVE_BY_DAMAGE: u8 = 2;`.
+> `damage_target`/`damage_boss`/`draw_one` are small helpers: `damage_target` parses `op:`/`boss:` and dispatches to `apply_unit_damage` (Task 5) or `damage_boss`; `damage_boss` reduces `outfit_at_mut(foe).boss_hp`, clamps at 0, emits `BossDamaged`, and appends `BossDefeated` (fields per Task 5) at 0. `draw_one` pops the front of `seat_state_at_mut(seat).deck` into `hand`. **Drive-By amount:** the client keys Drive-By off the card's `amount` field (2 for Stolen Whip, rules.ts:61/313), which `CardEffect::Summon` does not carry. For Subsystem 1 use a fixed `DRIVE_BY_DAMAGE = 2` constant (matches the only Drive-By card); Subsystem 2 makes it data-driven when the keyword catalog grows. Add `const DRIVE_BY_DAMAGE: u8 = 2;`.
 
 - [ ] **Step 5: Run the effect tests + full suite**
 
@@ -1272,7 +1283,7 @@ Run: `cargo test -p domain -- boss_definition` → FAIL, then implement Step 1's
         a.hero_power_effect = HeroPowerEffect::DealDamage { amount: 2 }; a.hero_power_cost = 2;
         session.configure_player_a(a);
         let mut b = OutfitConfig::new("m-1-b"); b.boss_hp = 10; session.configure_player_b(b);
-        session.set_opening_player(Player::A);
+        session.set_opening_player(Some(Player::A));
 
         let events = session
             .execute(ActivateHeroPower::new("m-1", "m-1-a", "boss:B", 2).into_command())
