@@ -32,11 +32,13 @@
 //! [`GameSessionRepository`] port — so the persistence adapters in
 //! `crates/mocks` and the actix-web server keep compiling unchanged.
 //!
-//! [`DeclareAttack`] (`DeclareAttackCmd`) then declares the turn-holding
-//! player's attacker into a defender, resolves combat simultaneously, and emits
-//! [`Event::CombatResolved`] (`combat.resolved`) followed by
-//! [`Event::BossDefeated`] (`boss.defeated`) when that combat drops the defending
-//! Boss.
+//! [`Attack`] (`AttackCmd`) then commits the turn-holding player's ready
+//! attacker at a `target_ref` (`"boss:<seat>"` | `"op:<instance_id>"`) and
+//! resolves real board combat: the attacker deals its atk to the target and, if
+//! the target is a unit, takes simultaneous retaliation. It emits
+//! `operator.damaged`/`operator.died`/`operator.exhausted` deltas over the
+//! [`BoardUnit`]s, and `boss.damaged` (with [`Event::BossDefeated`],
+//! `boss.defeated`, at 0 HP) against a Boss target.
 //!
 //! [`ActivateHeroPower`] (`ActivateHeroPowerCmd`) then activates the turn-holding
 //! player's Boss trademark hero power at a target: it pays the power's Juice cost
@@ -87,8 +89,8 @@ const MULLIGAN: &str = "MulliganCmd";
 /// The `PlayCardCmd` command name [`GameSession::execute`] recognizes.
 const PLAY_CARD: &str = "PlayCardCmd";
 
-/// The `DeclareAttackCmd` command name [`GameSession::execute`] recognizes.
-const DECLARE_ATTACK: &str = "DeclareAttackCmd";
+/// The `AttackCmd` command name [`GameSession::execute`] recognizes.
+const ATTACK: &str = "AttackCmd";
 
 /// The `ActivateHeroPowerCmd` command name [`GameSession::execute`] recognizes.
 const ACTIVATE_HERO_POWER: &str = "ActivateHeroPowerCmd";
@@ -380,46 +382,49 @@ impl PlayCard {
     }
 }
 
-/// The `DeclareAttackCmd` payload: the match being played, the player declaring
-/// the attack, the attacker they are committing, and the defender being attacked.
-/// Field names are the match-play schema's `camelCase`.
+/// The `AttackCmd` payload: the match being played, the player declaring the
+/// attack, the attacker they are committing, and the target reference being
+/// attacked. Field names are the match-play schema's `camelCase`.
+///
+/// `target_ref` resolves a combat target: `"boss:<seat>"` names the enemy Boss,
+/// `"op:<instance_id>"` names an enemy board unit.
 ///
 /// Build one directly and turn it into a [`Command`] with
-/// [`DeclareAttack::into_command`], or decode it from a command payload via
+/// [`Attack::into_command`], or decode it from a command payload via
 /// [`serde_json`] inside [`GameSession::execute`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct DeclareAttack {
+pub struct Attack {
     /// Identifier of the match being played; must name the match this session
     /// records.
     pub match_id: String,
     /// Identity of the player declaring the attack; must name one of this
     /// session's configured Outfits, and it must be that player's turn.
     pub player_id: String,
-    /// The attacking combatant. Must be non-blank.
+    /// The attacking combatant — a ready unit on the acting seat's board.
     pub attacker_id: String,
-    /// The defending target. Must be non-blank; in this slice it is treated as
-    /// the opposing Boss target that is defeated by the resolved combat.
-    pub defender_id: String,
+    /// The combat target: `"boss:<seat>"` for the enemy Boss, or
+    /// `"op:<instance_id>"` for an enemy board unit.
+    pub target_ref: String,
 }
 
-impl DeclareAttack {
+impl Attack {
     /// The command name this maps to.
-    pub const COMMAND: &'static str = DECLARE_ATTACK;
+    pub const COMMAND: &'static str = ATTACK;
 
-    /// Build a `DeclareAttackCmd` for `player_id` in `match_id`, committing
-    /// `attacker_id` against `defender_id`.
+    /// Build an `AttackCmd` for `player_id` in `match_id`, committing
+    /// `attacker_id` against `target_ref`.
     pub fn new(
         match_id: impl Into<String>,
         player_id: impl Into<String>,
         attacker_id: impl Into<String>,
-        defender_id: impl Into<String>,
+        target_ref: impl Into<String>,
     ) -> Self {
         Self {
             match_id: match_id.into(),
             player_id: player_id.into(),
             attacker_id: attacker_id.into(),
-            defender_id: defender_id.into(),
+            target_ref: target_ref.into(),
         }
     }
 
@@ -427,7 +432,7 @@ impl DeclareAttack {
     /// ready to hand to [`GameSession::execute`].
     pub fn into_command(&self) -> Command {
         // Serialization of a plain data struct to a Vec cannot fail here.
-        let payload = serde_json::to_vec(self).expect("DeclareAttack is always serializable");
+        let payload = serde_json::to_vec(self).expect("Attack is always serializable");
         Command::with_payload(Self::COMMAND, payload)
     }
 }
@@ -704,6 +709,62 @@ pub struct BossDefeated {
     pub winner: Player,
 }
 
+/// A board unit that took combat damage, carried by [`Event::OperatorDamaged`]
+/// and thus by the emitted `operator.damaged` event. `player` is the owner of
+/// the damaged unit (the defender in a trade).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OperatorDamaged {
+    /// The match the damage happened in.
+    pub match_id: String,
+    /// The seat that owns the damaged unit.
+    pub player: Player,
+    /// The instance id of the damaged unit.
+    pub instance_id: String,
+    /// The unit's HP after the damage was applied (saturating at 0).
+    pub new_hp: u8,
+}
+
+/// A board unit destroyed by combat (HP reached 0), carried by
+/// [`Event::OperatorDied`] and thus by the emitted `operator.died` event.
+/// `player` is the owner of the destroyed unit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OperatorDied {
+    /// The match the unit died in.
+    pub match_id: String,
+    /// The seat that owned the destroyed unit.
+    pub player: Player,
+    /// The instance id of the destroyed unit.
+    pub instance_id: String,
+}
+
+/// A Boss that took combat damage, carried by [`Event::BossDamaged`] and thus by
+/// the emitted `boss.damaged` event. `player` is the owner of the damaged Boss
+/// (the defender).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BossDamaged {
+    /// The match the damage happened in.
+    pub match_id: String,
+    /// The seat whose Boss was damaged.
+    pub player: Player,
+    /// The damage dealt to the Boss.
+    pub amount: i32,
+    /// The Boss's HP after the damage was applied (clamped at 0).
+    pub new_hp: i32,
+}
+
+/// A board unit that spent its attack and can no longer act this turn, carried
+/// by [`Event::OperatorExhausted`] and thus by the emitted `operator.exhausted`
+/// event. `player` is the owner (the attacker) of the exhausted unit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OperatorExhausted {
+    /// The match the attack happened in.
+    pub match_id: String,
+    /// The seat that owns the exhausted unit.
+    pub player: Player,
+    /// The instance id of the exhausted unit.
+    pub instance_id: String,
+}
+
 /// An activated Boss hero power, carried by [`Event::HeroPowerActivated`] and
 /// thus by the emitted `hero_power.activated` event.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -816,6 +877,14 @@ pub enum Event {
     CombatResolved(CombatResolved),
     /// Resolved combat defeated a Boss and ended the match for one winner.
     BossDefeated(BossDefeated),
+    /// A board unit took combat damage.
+    OperatorDamaged(OperatorDamaged),
+    /// A board unit was destroyed by combat.
+    OperatorDied(OperatorDied),
+    /// A Boss took combat damage.
+    BossDamaged(BossDamaged),
+    /// A board unit spent its attack and is exhausted for the turn.
+    OperatorExhausted(OperatorExhausted),
     /// A Boss trademark hero power passed every invariant, was paid for, and
     /// was activated.
     HeroPowerActivated(HeroPowerActivated),
@@ -839,6 +908,10 @@ impl DomainEvent for Event {
             Event::HeatRaised(_) => "heat.raised",
             Event::CombatResolved(_) => "combat.resolved",
             Event::BossDefeated(_) => "boss.defeated",
+            Event::OperatorDamaged(_) => "operator.damaged",
+            Event::OperatorDied(_) => "operator.died",
+            Event::BossDamaged(_) => "boss.damaged",
+            Event::OperatorExhausted(_) => "operator.exhausted",
             Event::HeroPowerActivated(_) => "hero_power.activated",
             Event::FatigueDamageDealt(_) => "fatigue.damage.dealt",
             Event::TurnEnded(_) => "turn.ended",
@@ -1576,11 +1649,14 @@ impl GameSession {
         Ok(vec![played, raised])
     }
 
-    /// Handle `DeclareAttackCmd`: verify the command targets this match, a real
-    /// turn-holding player, and well-formed attacker/defender references;
-    /// enforce every match-play invariant; resolve combat simultaneously; and
-    /// emit [`Event::CombatResolved`] followed by [`Event::BossDefeated`].
-    fn declare_attack(&mut self, cmd: DeclareAttack) -> Result<Vec<Event>, DomainError> {
+    /// Handle `AttackCmd`: verify the command targets this match and a real
+    /// turn-holding player; enforce every match-play invariant; then resolve
+    /// real combat over [`BoardUnit`]s. The attacker deals its atk to the
+    /// target and, if the target is a unit, takes simultaneous retaliation;
+    /// dead units are removed and the surviving attacker exhausts. A Boss
+    /// target reduces `boss_hp`, emitting [`Event::BossDamaged`] and, at 0,
+    /// [`Event::BossDefeated`].
+    fn declare_attack(&mut self, cmd: Attack) -> Result<Vec<Event>, DomainError> {
         // The command must name the match this session actually records.
         if cmd.match_id != self.match_id {
             return Err(DomainError::InvariantViolation(format!(
@@ -1596,25 +1672,12 @@ impl GameSession {
         }
         let seat = self.seat_for_player(&cmd.player_id)?;
 
-        // Combat must name both sides. The rules engine slice does not yet carry
-        // individual combatant stats, so the target id is the defeated Boss ref.
+        // An attacker must be named; its existence/readiness is checked below
+        // against the live board.
         if cmd.attacker_id.trim().is_empty() {
             return Err(DomainError::InvariantViolation(
                 "an attackerId must be provided".to_string(),
             ));
-        }
-        if cmd.defender_id.trim().is_empty() {
-            return Err(DomainError::InvariantViolation(
-                "a defenderId must be provided".to_string(),
-            ));
-        }
-        let defending_player = Self::opponent_of(seat);
-        let expected_defender_id = self.outfit_at(defending_player).boss_name.clone();
-        if cmd.defender_id != expected_defender_id {
-            return Err(DomainError::InvariantViolation(format!(
-                "defenderId '{}' does not name player {defending_player:?}'s Boss target '{}'",
-                cmd.defender_id, expected_defender_id
-            )));
         }
 
         // Enforce every match-play invariant before applying the attack.
@@ -1634,31 +1697,173 @@ impl GameSession {
             )));
         }
 
-        let defeated_player_id = self.outfit_at(defending_player).name.clone();
+        // Resolve target from target_ref: "boss:<seat>" | "op:<instance_id>".
+        let defending_player = Self::opponent_of(seat);
+        let target = cmd.target_ref.as_str();
 
-        let resolved = Event::CombatResolved(CombatResolved {
-            match_id: cmd.match_id.clone(),
-            attacking_player_id: cmd.player_id,
-            attacking_player: seat,
-            attacker_id: cmd.attacker_id,
-            defending_player,
-            defender_id: cmd.defender_id.clone(),
-        });
-        let defeated = Event::BossDefeated(BossDefeated {
-            match_id: cmd.match_id,
-            defeated_player_id,
-            defeated_player: defending_player,
-            boss_id: cmd.defender_id,
-            winner: seat,
-        });
+        // Attacker must be a READY unit the acting seat owns.
+        let attacker = self
+            .seat_state_at(seat)
+            .board
+            .iter()
+            .find(|u| u.instance_id == cmd.attacker_id)
+            .ok_or_else(|| {
+                DomainError::InvariantViolation(format!(
+                    "no unit '{}' on the attacker's board",
+                    cmd.attacker_id
+                ))
+            })?;
+        if !attacker.ready {
+            return Err(DomainError::InvariantViolation(format!(
+                "unit '{}' is not ready (summoning sickness)",
+                cmd.attacker_id
+            )));
+        }
+        let attacker_atk = attacker.atk;
 
-        // Apply the lethal combat result so the aggregate no longer carries a
-        // live defending Boss after emitting the defeat.
-        self.outfit_at_mut(defending_player).boss_hp = 0;
+        // Spotlight: if the defender has any Spotlight unit, the target must be one.
+        let has_spotlight = self
+            .seat_state_at(defending_player)
+            .board
+            .iter()
+            .any(|u| u.keywords.contains(&Keyword::Spotlight));
+        if has_spotlight {
+            let targeting_spotlight = target.strip_prefix("op:").is_some_and(|id| {
+                self.seat_state_at(defending_player)
+                    .board
+                    .iter()
+                    .any(|u| u.instance_id == id && u.keywords.contains(&Keyword::Spotlight))
+            });
+            if !targeting_spotlight {
+                return Err(DomainError::InvariantViolation(
+                    "must attack a Spotlight unit first".to_string(),
+                ));
+            }
+        }
 
-        self.root.record(Box::new(resolved.clone()));
-        self.root.record(Box::new(defeated.clone()));
-        Ok(vec![resolved, defeated])
+        let mut events: Vec<Event> = Vec::new();
+        if let Some(defender_id) = target.strip_prefix("op:") {
+            // Capture both attack values BEFORE applying damage (simultaneous).
+            let retaliation = self
+                .seat_state_at(defending_player)
+                .board
+                .iter()
+                .find(|u| u.instance_id == defender_id)
+                .map(|u| u.atk)
+                .ok_or_else(|| {
+                    DomainError::InvariantViolation(format!("no defender '{defender_id}'"))
+                })?;
+            // Apply attacker -> defender.
+            events.extend(self.apply_unit_damage(defending_player, defender_id, attacker_atk));
+            // Apply defender -> attacker (retaliation).
+            if retaliation > 0 {
+                events.extend(self.apply_unit_damage(seat, &cmd.attacker_id, retaliation));
+            }
+        } else if let Some(boss_seat) = target.strip_prefix("boss:") {
+            let _ = boss_seat; // target names the enemy boss; enforce it is the defender
+            let outfit = self.outfit_at_mut(defending_player);
+            outfit.boss_hp -= attacker_atk as i32;
+            let new_hp = outfit.boss_hp.max(0);
+            events.push(Event::BossDamaged(BossDamaged {
+                match_id: self.match_id.clone(),
+                player: defending_player,
+                amount: attacker_atk as i32,
+                new_hp,
+            }));
+            if new_hp == 0 {
+                // Terminal: reuse the existing BossDefeated event (what the old
+                // declare_attack emitted) — MatchCompleted is concession-shaped
+                // and wrong for a combat kill.
+                let defeated_player_id = self.outfit_at(defending_player).name.clone();
+                let boss_id = self.outfit_at(defending_player).boss_name.clone();
+                events.push(Event::BossDefeated(BossDefeated {
+                    match_id: self.match_id.clone(),
+                    defeated_player_id,
+                    defeated_player: defending_player,
+                    boss_id,
+                    winner: seat,
+                }));
+            }
+        } else {
+            return Err(DomainError::InvariantViolation(format!(
+                "malformed targetRef '{}'",
+                cmd.target_ref
+            )));
+        }
+
+        // Attacker exhausts if it survived the trade.
+        if self
+            .seat_state_at(seat)
+            .board
+            .iter()
+            .any(|u| u.instance_id == cmd.attacker_id)
+        {
+            events.push(Event::OperatorExhausted(OperatorExhausted {
+                match_id: self.match_id.clone(),
+                player: seat,
+                instance_id: cmd.attacker_id.clone(),
+            }));
+            if let Some(u) = self
+                .seat_state_at_mut(seat)
+                .board
+                .iter_mut()
+                .find(|u| u.instance_id == cmd.attacker_id)
+            {
+                u.ready = false;
+            }
+        }
+
+        for e in &events {
+            self.root.record(Box::new(e.clone()));
+        }
+        Ok(events)
+    }
+
+    /// Apply `amount` damage to `owner`'s unit `instance_id`, returning the
+    /// resulting deltas ([`Event::OperatorDamaged`], and [`Event::OperatorDied`]
+    /// if it drops to 0). Removes the unit from the board when it dies. Reused
+    /// by effect resolution (Task 6).
+    fn apply_unit_damage(&mut self, owner: Player, instance_id: &str, amount: u8) -> Vec<Event> {
+        let mut out = Vec::new();
+        let board = &mut self.seat_state_at_mut(owner).board;
+        if let Some(u) = board.iter_mut().find(|u| u.instance_id == instance_id) {
+            let new_hp = u.hp.saturating_sub(amount);
+            u.hp = new_hp;
+            out.push(Event::OperatorDamaged(OperatorDamaged {
+                match_id: String::new(),
+                player: owner,
+                instance_id: instance_id.to_string(),
+                new_hp,
+            }));
+            if new_hp == 0 {
+                out.push(Event::OperatorDied(OperatorDied {
+                    match_id: String::new(),
+                    player: owner,
+                    instance_id: instance_id.to_string(),
+                }));
+            }
+        }
+        if let Some(dead) = out.iter().find_map(|e| {
+            if let Event::OperatorDied(d) = e {
+                Some(d.instance_id.clone())
+            } else {
+                None
+            }
+        }) {
+            self.seat_state_at_mut(owner)
+                .board
+                .retain(|b| b.instance_id != dead);
+        }
+        // Fill in match_id after the &mut board borrow has ended.
+        let mid = self.match_id.clone();
+        for e in out.iter_mut() {
+            match e {
+                Event::OperatorDamaged(d) => d.match_id = mid.clone(),
+                Event::OperatorDied(d) => d.match_id = mid.clone(),
+                _ => {}
+            }
+        }
+        out
     }
 
     /// Handle `ActivateHeroPowerCmd`: verify the command targets this match, a
@@ -1980,11 +2185,9 @@ impl Aggregate for GameSession {
                 })?;
                 self.play_card(cmd)
             }
-            DECLARE_ATTACK => {
-                let cmd: DeclareAttack = serde_json::from_slice(&command.payload).map_err(|e| {
-                    DomainError::InvariantViolation(format!(
-                        "malformed DeclareAttackCmd payload: {e}"
-                    ))
+            ATTACK => {
+                let cmd: Attack = serde_json::from_slice(&command.payload).map_err(|e| {
+                    DomainError::InvariantViolation(format!("malformed AttackCmd payload: {e}"))
                 })?;
                 self.declare_attack(cmd)
             }
@@ -2910,64 +3113,111 @@ mod tests {
         assert_eq!(decoded, valid_play_card());
     }
 
-    // ---- DeclareAttackCmd (S-5) --------------------------------------------
+    // ---- AttackCmd (S-5) ---------------------------------------------------
 
-    /// A legal `DeclareAttackCmd` for `m-1`: the turn-holding player `A`
-    /// commits an attacker into player `B`'s Boss target.
-    fn valid_declare_attack() -> DeclareAttack {
-        DeclareAttack::new("m-1", "m-1-a", "attacker-1", "m-1-b-boss")
+    /// Build a board unit for combat tests.
+    fn test_unit(id: &str, atk: u8, hp: u8, ready: bool, is_vehicle: bool, kws: &[Keyword]) -> BoardUnit {
+        BoardUnit { instance_id: id.to_string(), card_id: "test".to_string(), atk, hp, max_hp: hp, ready, is_vehicle, keywords: kws.to_vec() }
     }
 
-    // Scenario: Successfully execute DeclareAttackCmd — combat.resolved and
-    // boss.defeated are emitted in order.
     #[test]
-    fn declares_attack_and_emits_combat_resolved_and_boss_defeated_events() {
+    fn attack_unit_is_simultaneous_with_retaliation() {
         let mut session = valid_session();
+        session.set_opening_player(Some(Player::A));
+        // A attacker 3/2, B defender 2/5.
+        session.seat_state_at_mut(Player::A).board.push(test_unit("A-atk", 3, 2, true, false, &[]));
+        session.seat_state_at_mut(Player::B).board.push(test_unit("B-def", 2, 5, true, false, &[]));
 
         let events = session
-            .execute(valid_declare_attack().into_command())
+            .execute(Attack::new("m-1", "m-1-a", "A-atk", "op:B-def").into_command())
+            .expect("A attacks B's unit");
+
+        // Defender took 3 (5 -> 2); attacker took retaliation 2 (2 -> 0) and died.
+        assert!(events.iter().any(|e| matches!(e, Event::OperatorDamaged(d) if d.instance_id == "B-def" && d.new_hp == 2)));
+        assert!(events.iter().any(|e| matches!(e, Event::OperatorDied(d) if d.instance_id == "A-atk")));
+        assert!(session.seat_state_at(Player::A).board.iter().all(|u| u.instance_id != "A-atk"));
+    }
+
+    #[test]
+    fn attack_boss_reduces_hp_and_ends_match_at_zero() {
+        let mut session = valid_session();
+        session.set_opening_player(Some(Player::A));
+        let mut b = OutfitConfig::new("m-1-b");
+        b.boss_hp = 3;
+        session.configure_player_b(b);
+        session.seat_state_at_mut(Player::A).board.push(test_unit("A-atk", 5, 5, true, false, &[]));
+
+        let events = session
+            .execute(Attack::new("m-1", "m-1-a", "A-atk", "boss:B").into_command())
+            .expect("A attacks B's boss");
+
+        assert!(events.iter().any(|e| matches!(e, Event::BossDamaged(d) if d.new_hp == 0)));
+        assert!(events.iter().any(|e| matches!(e, Event::BossDefeated(d) if d.winner == Player::A)));
+    }
+
+    #[test]
+    fn spotlight_forces_attack_onto_taunt_unit() {
+        let mut session = valid_session();
+        session.set_opening_player(Some(Player::A));
+        session.seat_state_at_mut(Player::A).board.push(test_unit("A-atk", 2, 2, true, false, &[]));
+        session.seat_state_at_mut(Player::B).board.push(test_unit("B-taunt", 0, 4, true, false, &[Keyword::Spotlight]));
+        // Attacking the boss while a Spotlight unit stands is rejected.
+        let err = session
+            .execute(Attack::new("m-1", "m-1-a", "A-atk", "boss:B").into_command())
+            .expect_err("must hit the Spotlight first");
+        assert!(matches!(err, DomainError::InvariantViolation(_)));
+    }
+
+    #[test]
+    fn attack_cmd_is_recognized_not_unknown() {
+        let mut session = valid_session();
+        let err = session.execute(Attack::new("m-1", "m-1-a", "x", "boss:B").into_command());
+        // Whatever the rejection reason, it must NOT be UnknownCommand — the rename worked.
+        assert!(!matches!(err, Err(DomainError::UnknownCommand { .. })));
+    }
+
+    /// A legal `AttackCmd` for `m-1`: the turn-holding player `A`
+    /// commits an attacker against player `B`'s Boss target.
+    fn valid_attack() -> Attack {
+        Attack::new("m-1", "m-1-a", "attacker-1", "boss:B")
+    }
+
+    // Scenario: attacking a Boss below lethal reduces its HP, does not defeat
+    // it, and exhausts the surviving attacker. (Rewritten from the removed
+    // boss-instakill happy path, which set boss_hp = 0 and emitted
+    // combat.resolved + boss.defeated unconditionally.)
+    #[test]
+    fn attack_boss_deals_nonlethal_damage_and_exhausts_attacker() {
+        let mut session = valid_session();
+        session.set_opening_player(Some(Player::A));
+        // Default boss_hp is 30; a 4-atk attacker leaves it alive at 26.
+        session
+            .seat_state_at_mut(Player::A)
+            .board
+            .push(test_unit("A-atk", 4, 5, true, false, &[]));
+
+        let events = session
+            .execute(Attack::new("m-1", "m-1-a", "A-atk", "boss:B").into_command())
             .expect("a valid attack should succeed");
 
-        assert_eq!(events.len(), 2);
-        assert_eq!(events[0].event_type(), "combat.resolved");
-        assert_eq!(events[1].event_type(), "boss.defeated");
-        match &events[0] {
-            Event::CombatResolved(resolved) => {
-                assert_eq!(resolved.match_id, "m-1");
-                assert_eq!(resolved.attacking_player_id, "m-1-a");
-                assert_eq!(resolved.attacking_player, Player::A);
-                assert_eq!(resolved.attacker_id, "attacker-1");
-                assert_eq!(resolved.defending_player, Player::B);
-                assert_eq!(resolved.defender_id, "m-1-b-boss");
-            }
-            other => panic!("expected CombatResolved, got {other:?}"),
-        }
-        match &events[1] {
-            Event::BossDefeated(defeated) => {
-                assert_eq!(defeated.match_id, "m-1");
-                assert_eq!(defeated.defeated_player_id, "m-1-b");
-                assert_eq!(defeated.defeated_player, Player::B);
-                assert_eq!(defeated.boss_id, "m-1-b-boss");
-                assert_eq!(defeated.winner, Player::A);
-            }
-            other => panic!("expected BossDefeated, got {other:?}"),
-        }
-        assert_eq!(session.version(), 2);
-        assert_eq!(session.uncommitted_events().len(), 2);
-        assert_eq!(
-            session.uncommitted_events()[0].event_type(),
-            "combat.resolved"
-        );
-        assert_eq!(
-            session.uncommitted_events()[1].event_type(),
-            "boss.defeated"
-        );
-
-        let err = session
-            .execute(valid_declare_attack().into_command())
-            .expect_err("a defeated Boss must end the match before another attack");
-        assert!(matches!(err, DomainError::InvariantViolation(_)));
-        assert_eq!(session.version(), 2);
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, Event::BossDamaged(d) if d.player == Player::B && d.new_hp == 26)));
+        assert!(!events
+            .iter()
+            .any(|e| matches!(e, Event::BossDefeated(_))));
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, Event::OperatorExhausted(d) if d.instance_id == "A-atk")));
+        // The attacker survived and is now exhausted (not ready).
+        let attacker = session
+            .seat_state_at(Player::A)
+            .board
+            .iter()
+            .find(|u| u.instance_id == "A-atk")
+            .expect("attacker survived the boss trade");
+        assert!(!attacker.ready);
+        assert_eq!(session.uncommitted_events().len(), events.len());
     }
 
     // Scenario: rejected — Juice starts at 1 and remains hard-capped at 10.
@@ -2979,7 +3229,7 @@ mod tests {
         session.configure_player_a(outfit);
 
         let err = session
-            .execute(valid_declare_attack().into_command())
+            .execute(valid_attack().into_command())
             .expect_err("an illegal opening Juice must be rejected");
         assert!(matches!(err, DomainError::InvariantViolation(_)));
         assert_eq!(session.version(), 0);
@@ -2993,7 +3243,7 @@ mod tests {
         session.configure_player_a(outfit);
 
         let err = session
-            .execute(valid_declare_attack().into_command())
+            .execute(valid_attack().into_command())
             .expect_err("available Juice over the hard cap must be rejected");
         assert!(matches!(err, DomainError::InvariantViolation(_)));
         assert_eq!(session.version(), 0);
@@ -3008,7 +3258,7 @@ mod tests {
         session.configure_player_a(outfit);
 
         let err = session
-            .execute(valid_declare_attack().into_command())
+            .execute(valid_attack().into_command())
             .expect_err("an over-capacity board must be rejected");
         assert!(matches!(err, DomainError::InvariantViolation(_)));
         assert_eq!(session.version(), 0);
@@ -3022,7 +3272,7 @@ mod tests {
         session.configure_player_b(outfit);
 
         let err = session
-            .execute(valid_declare_attack().into_command())
+            .execute(valid_attack().into_command())
             .expect_err("an over-capacity vehicle board must be rejected");
         assert!(matches!(err, DomainError::InvariantViolation(_)));
         assert_eq!(session.version(), 0);
@@ -3037,7 +3287,7 @@ mod tests {
         session.configure_player_a(outfit);
 
         let err = session
-            .execute(valid_declare_attack().into_command())
+            .execute(valid_attack().into_command())
             .expect_err("Heat outside its bounds must be rejected");
         assert!(matches!(err, DomainError::InvariantViolation(_)));
         assert_eq!(session.version(), 0);
@@ -3054,7 +3304,7 @@ mod tests {
         session.configure_player_a(outfit);
 
         let err = session
-            .execute(valid_declare_attack().into_command())
+            .execute(valid_attack().into_command())
             .expect_err("a Heist resolved with outstanding prereqs must be rejected");
         assert!(matches!(err, DomainError::InvariantViolation(_)));
         assert_eq!(session.version(), 0);
@@ -3070,7 +3320,7 @@ mod tests {
         session.configure_player_b(outfit);
 
         let err = session
-            .execute(valid_declare_attack().into_command())
+            .execute(valid_attack().into_command())
             .expect_err("an empty deck must be rejected");
         assert!(matches!(err, DomainError::InvariantViolation(_)));
         assert_eq!(session.version(), 0);
@@ -3083,7 +3333,7 @@ mod tests {
         let mut session = valid_session();
         // Player A holds the turn; player B tries to declare an attack.
         let err = session
-            .execute(DeclareAttack::new("m-1", "m-1-b", "attacker-1", "m-1-a-boss").into_command())
+            .execute(Attack::new("m-1", "m-1-b", "attacker-1", "boss:A").into_command())
             .expect_err("an off-turn attack must be rejected");
         assert!(matches!(err, DomainError::InvariantViolation(_)));
         assert_eq!(session.version(), 0);
@@ -3096,7 +3346,7 @@ mod tests {
         session.set_opening_player(None);
 
         let err = session
-            .execute(valid_declare_attack().into_command())
+            .execute(valid_attack().into_command())
             .expect_err("a turn-less setup must be rejected");
         assert!(matches!(err, DomainError::InvariantViolation(_)));
         assert_eq!(session.version(), 0);
@@ -3112,7 +3362,7 @@ mod tests {
         session.configure_player_a(outfit);
 
         let err = session
-            .execute(valid_declare_attack().into_command())
+            .execute(valid_attack().into_command())
             .expect_err("a defeated Boss must be rejected");
         assert!(matches!(err, DomainError::InvariantViolation(_)));
         assert_eq!(session.version(), 0);
@@ -3124,8 +3374,7 @@ mod tests {
         let mut session = valid_session();
         let err = session
             .execute(
-                DeclareAttack::new("other-match", "m-1-a", "attacker-1", "m-1-b-boss")
-                    .into_command(),
+                Attack::new("other-match", "m-1-a", "attacker-1", "boss:B").into_command(),
             )
             .expect_err("a mismatched match id must be rejected");
         assert!(matches!(err, DomainError::InvariantViolation(_)));
@@ -3137,7 +3386,7 @@ mod tests {
     fn declare_attack_rejects_unknown_player() {
         let mut session = valid_session();
         let err = session
-            .execute(DeclareAttack::new("m-1", "ghost", "attacker-1", "m-1-b-boss").into_command())
+            .execute(Attack::new("m-1", "ghost", "attacker-1", "boss:B").into_command())
             .expect_err("an unknown player must be rejected");
         assert!(matches!(err, DomainError::InvariantViolation(_)));
         assert_eq!(session.version(), 0);
@@ -3148,41 +3397,56 @@ mod tests {
     fn declare_attack_rejects_blank_attacker_id() {
         let mut session = valid_session();
         let err = session
-            .execute(DeclareAttack::new("m-1", "m-1-a", " ", "m-1-b-boss").into_command())
+            .execute(Attack::new("m-1", "m-1-a", " ", "boss:B").into_command())
             .expect_err("a blank attackerId must be rejected");
         assert!(matches!(err, DomainError::InvariantViolation(_)));
         assert_eq!(session.version(), 0);
     }
 
-    // An attack must identify the defending target.
+    // Scenario: rejected — a malformed target_ref (neither "boss:" nor "op:")
+    // is invalid. (Rewritten from the removed blank-defender_id test: real
+    // combat parses a target_ref rather than validating a defeated-Boss name.)
     #[test]
-    fn declare_attack_rejects_blank_defender_id() {
+    fn attack_rejects_malformed_target_ref() {
         let mut session = valid_session();
+        session.set_opening_player(Some(Player::A));
+        session
+            .seat_state_at_mut(Player::A)
+            .board
+            .push(test_unit("A-atk", 2, 2, true, false, &[]));
+
         let err = session
-            .execute(DeclareAttack::new("m-1", "m-1-a", "attacker-1", "").into_command())
-            .expect_err("a blank defenderId must be rejected");
+            .execute(Attack::new("m-1", "m-1-a", "A-atk", "").into_command())
+            .expect_err("a malformed targetRef must be rejected");
         assert!(matches!(err, DomainError::InvariantViolation(_)));
         assert_eq!(session.version(), 0);
     }
 
-    // An attack that resolves into boss.defeated must target the opposing Boss.
+    // Scenario: rejected — an "op:" target that names no enemy unit is invalid.
+    // (Rewritten from the removed non-opposing-Boss defender_id test.)
     #[test]
-    fn declare_attack_rejects_non_opposing_boss_defender_id() {
+    fn attack_rejects_nonexistent_op_target() {
         let mut session = valid_session();
+        session.set_opening_player(Some(Player::A));
+        session
+            .seat_state_at_mut(Player::A)
+            .board
+            .push(test_unit("A-atk", 2, 2, true, false, &[]));
+
         let err = session
-            .execute(DeclareAttack::new("m-1", "m-1-a", "attacker-1", "target-1").into_command())
-            .expect_err("a non-Boss defenderId must be rejected");
+            .execute(Attack::new("m-1", "m-1-a", "A-atk", "op:ghost").into_command())
+            .expect_err("an op target naming no unit must be rejected");
         assert!(matches!(err, DomainError::InvariantViolation(_)));
         assert_eq!(session.version(), 0);
     }
 
     #[test]
-    fn declare_attack_command_payload_round_trips() {
-        let cmd = valid_declare_attack();
+    fn attack_command_payload_round_trips() {
+        let cmd = valid_attack();
         let command = cmd.into_command();
-        assert_eq!(command.name, DeclareAttack::COMMAND);
-        let decoded: DeclareAttack = serde_json::from_slice(&command.payload).unwrap();
-        assert_eq!(decoded, valid_declare_attack());
+        assert_eq!(command.name, Attack::COMMAND);
+        let decoded: Attack = serde_json::from_slice(&command.payload).unwrap();
+        assert_eq!(decoded, valid_attack());
     }
 
     // ---- ActivateHeroPowerCmd (S-6) ----------------------------------------

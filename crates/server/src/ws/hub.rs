@@ -494,6 +494,28 @@ fn delta_event_json(event: &Event) -> serde_json::Value {
             "bossId": e.boss_id,
             "winner": player_tag(e.winner),
         }),
+        Event::OperatorDamaged(e) => json!({
+            "matchId": e.match_id,
+            "player": player_tag(e.player),
+            "instanceId": e.instance_id,
+            "newHp": e.new_hp,
+        }),
+        Event::OperatorDied(e) => json!({
+            "matchId": e.match_id,
+            "player": player_tag(e.player),
+            "instanceId": e.instance_id,
+        }),
+        Event::BossDamaged(e) => json!({
+            "matchId": e.match_id,
+            "player": player_tag(e.player),
+            "amount": e.amount,
+            "newHp": e.new_hp,
+        }),
+        Event::OperatorExhausted(e) => json!({
+            "matchId": e.match_id,
+            "player": player_tag(e.player),
+            "instanceId": e.instance_id,
+        }),
         Event::HeroPowerActivated(e) => json!({
             "matchId": e.match_id,
             "playerId": e.player_id,
