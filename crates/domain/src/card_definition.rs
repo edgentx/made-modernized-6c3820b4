@@ -41,6 +41,7 @@ pub const REGISTERED_EFFECTS: &[&str] = &[
     "effect.deal_damage",
     "effect.draw_card",
     "effect.gain_juice",
+    "effect.cool",
     "effect.steal_piece",
     "effect.recruit_operator",
     "effect.pull_heist",

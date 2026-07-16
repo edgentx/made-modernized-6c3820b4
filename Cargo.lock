@@ -851,6 +851,7 @@ dependencies = [
 name = "game-session"
 version = "0.1.0"
 dependencies = [
+ "domain",
  "serde",
  "serde_json",
  "shared",

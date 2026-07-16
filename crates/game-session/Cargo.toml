@@ -13,6 +13,11 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 shared = { workspace = true }
+# Read-only: game-session iterates domain::card_definition::REGISTERED_EFFECTS
+# for its CardEffect coverage test. domain compiles to wasm32 (it only decodes
+# serde payloads like game-session does), so this keeps the dual native/WASM
+# build working; verified via `cargo build -p game-session --features wasm`.
+domain = { workspace = true }
 # serde/serde_json decode the typed StartMatch command payload. Both compile to
 # wasm32, so they keep the dual native/WASM build working (mirrors the domain
 # aggregates, which decode their command payloads the same way).

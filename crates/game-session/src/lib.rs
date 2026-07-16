@@ -843,6 +843,60 @@ impl DomainEvent for Event {
     }
 }
 
+/// The closed set of card effects the engine can resolve. Mirrors the client's
+/// `resolveEffect` (web/src/match/rules.ts:299). Extended in Subsystem 2.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum CardEffect {
+    None,
+    DealDamage { amount: u8 },
+    Summon, // stats come from the CardInstance's atk/hp
+    DrawCards { amount: u8 },
+    GainJuice { amount: u8 },
+    Cool { amount: u8 }, // lower own Heat
+}
+
+impl CardEffect {
+    /// Total mapping from a catalog `effect_script_ref` to a resolvable effect.
+    /// `amount` fields default to 0 here; the concrete amount is carried on the
+    /// CardInstance at deck-build (Task 4). Returns None for unregistered names.
+    pub fn from_script_ref(script_ref: &str) -> Option<CardEffect> {
+        Some(match script_ref {
+            "effect.noop" => CardEffect::None,
+            "effect.deal_damage" => CardEffect::DealDamage { amount: 0 },
+            "effect.draw_card" => CardEffect::DrawCards { amount: 0 },
+            "effect.gain_juice" => CardEffect::GainJuice { amount: 0 },
+            "effect.cool" => CardEffect::Cool { amount: 0 },
+            "effect.recruit_operator" => CardEffect::Summon,
+            // Subsystem-2 mechanics: registered + validated, resolve to no-op for now.
+            "effect.steal_piece" | "effect.pull_heist" => CardEffect::None,
+            _ => return None,
+        })
+    }
+}
+
+/// Engine-semantic keywords (bound to real behavior in combat/summon), not inert
+/// strings. Mirrors the client's ad-hoc Spotlight/Drive-By checks. Extended in
+/// Subsystem 2.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum Keyword {
+    Spotlight, // taunt: enemy attacks must target a Spotlight unit first
+    DriveBy,   // on arrival, deal damage to the enemy Boss
+}
+
+impl Keyword {
+    /// Parse a catalog keyword string; unknown keywords are rejected (mirrors
+    /// CardType::parse). Accepts the client's exact spellings.
+    pub fn parse(raw: &str) -> Result<Keyword, DomainError> {
+        match raw {
+            "Spotlight" => Ok(Keyword::Spotlight),
+            "Drive-By" => Ok(Keyword::DriveBy),
+            other => Err(DomainError::InvariantViolation(format!(
+                "unknown keyword '{other}'"
+            ))),
+        }
+    }
+}
+
 /// The GameSession aggregate: the authoritative state of a single match.
 ///
 /// Mirrors the shape produced by [`shared::stub_aggregate!`] (identity plus an
@@ -1834,6 +1888,46 @@ mod wasm_bindings {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn card_effect_maps_every_registered_effect() {
+        // Coverage guard: every catalog-registered effect must map to a CardEffect,
+        // so adding a REGISTERED_EFFECTS entry without a mapping fails loudly.
+        for name in domain::card_definition::REGISTERED_EFFECTS {
+            assert!(
+                CardEffect::from_script_ref(name).is_some(),
+                "registered effect {name} has no CardEffect mapping"
+            );
+        }
+    }
+
+    #[test]
+    fn card_effect_maps_known_names() {
+        assert_eq!(
+            CardEffect::from_script_ref("effect.noop"),
+            Some(CardEffect::None)
+        );
+        assert_eq!(
+            CardEffect::from_script_ref("effect.deal_damage"),
+            Some(CardEffect::DealDamage { amount: 0 })
+        );
+        assert_eq!(
+            CardEffect::from_script_ref("effect.recruit_operator"),
+            Some(CardEffect::Summon)
+        );
+        assert_eq!(
+            CardEffect::from_script_ref("effect.cool"),
+            Some(CardEffect::Cool { amount: 0 })
+        );
+        assert_eq!(CardEffect::from_script_ref("effect.unknown"), None);
+    }
+
+    #[test]
+    fn keyword_parse_accepts_known_rejects_unknown() {
+        assert_eq!(Keyword::parse("Spotlight").unwrap(), Keyword::Spotlight);
+        assert_eq!(Keyword::parse("Drive-By").unwrap(), Keyword::DriveBy);
+        assert!(Keyword::parse("Bogus").is_err());
+    }
 
     /// A session `m-1` set up as a legal opening: two default Outfits within all
     /// caps, healthy Bosses, and player `A` to move. Tests mutate one aspect at a
