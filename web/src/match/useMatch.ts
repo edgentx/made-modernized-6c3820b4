@@ -98,6 +98,11 @@ export function useMatch(matchId = 'live', ticket?: string): MatchController {
       return
     }
 
+    // The local player's identity is the name of the Outfit it is seated as —
+    // `<matchId>-a` for seat A — matching the domain's `OutfitConfig` naming
+    // (`startMatch` above) and what the server's `seat_for_player` resolves.
+    const selfPlayerId = `${matchId}-${SELF_SEAT.toLowerCase()}`
+
     const conn = new MatchConnection(
       {
         onStatus: setStatus,
@@ -125,13 +130,17 @@ export function useMatch(matchId = 'live', ticket?: string): MatchController {
           rerender()
         },
       },
+      // The match this connection acts on; rides in every action envelope.
+      matchId,
+      // The local player's identity; the server requires it on every action.
+      selfPlayerId,
       // A mission launch joins the AI-opponent's authoritative match via its ticket.
       ticket,
     )
     connection.current = conn
     conn.connect()
     return () => conn.close()
-  }, [mode, ticket, raiseCorrection, rerender])
+  }, [mode, matchId, ticket, raiseCorrection, rerender])
 
   // Canvas renderer + animation loop. Redraws from refs each frame and decays the
   // correction flash; a ResizeObserver keeps the backing store matched to the box.

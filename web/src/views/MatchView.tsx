@@ -206,7 +206,7 @@ export default function MatchView() {
 }
 
 /** A boss resource bar: HP, Heat, Juice. Optionally a face-attack / drop target. */
-function BossBar({ seat, s, face, onFace, dropOk, onDropCard }: { seat: string; s: { bossName: string; bossHp: number; heat: number; juice: number }; face?: boolean; onFace?: () => void; dropOk?: boolean; onDropCard?: () => void }) {
+function BossBar({ seat, s, face, onFace, dropOk, onDropCard }: { seat: string; s: { bossName: string; bossHp: number; heat: number; juice: number; maxJuice: number }; face?: boolean; onFace?: () => void; dropOk?: boolean; onDropCard?: () => void }) {
   return (
     <div
       className={`bossbar${face || dropOk ? ' bossbar--target' : ''}`}
@@ -221,7 +221,7 @@ function BossBar({ seat, s, face, onFace, dropOk, onDropCard }: { seat: string; 
       </div>
       <div className="bossbar__meters">
         <span className="bossbar__heat">Heat {s.heat}/10</span>
-        <span className="bossbar__juice">Juice {s.juice}/10</span>
+        <span className="bossbar__juice">Juice {s.juice}/{s.maxJuice}</span>
       </div>
       {face ? <span className="bossbar__aim">⌖ attack</span> : null}
     </div>

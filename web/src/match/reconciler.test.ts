@@ -71,7 +71,7 @@ describe('Reconciler', () => {
     r.predict(play) // A predicts a card while it is A's turn
     // Server truth: A's turn actually ended → A no longer holds the turn.
     const correction = r.applyAuthoritative([
-      { type: 'turn.ended', player: 'A', nextPlayer: 'B', nextPlayerJuice: 4 },
+      { type: 'turn.ended', player: 'A', nextPlayer: 'B', nextPlayerJuice: 4, nextPlayerMaxJuice: 4 },
     ])
     expect(correction.dropped).toHaveLength(1)
     expect(r.view().turn).toBe('B')

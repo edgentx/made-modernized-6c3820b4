@@ -56,8 +56,8 @@ export const CARD_POOL: readonly CardDef[] = [
   { cardId: 'w_the_homie', name: 'The Homie', cost: 2, type: 'Operator', effect: 'summon', amount: 0, atk: 3, hp: 2, text: '3/2. Loyal muscle.' },
   { cardId: 'w_the_enforcer', name: 'The Enforcer', cost: 3, type: 'Operator', effect: 'summon', amount: 0, atk: 2, hp: 5, keywords: ['Spotlight'], text: '2/5. Spotlight — enemies must deal with it first.' },
   { cardId: 'pd_riot_squad', name: 'Riot Squad', cost: 5, type: 'Operator', effect: 'summon', amount: 0, atk: 4, hp: 5, keywords: ['Spotlight'], text: '4/5. Spotlight.' },
-  { cardId: 'pd_the_crib', name: 'The Crib', cost: 2, type: 'Operation', effect: 'cool', amount: 2, text: 'Lower your Heat by 2.' },
-  { cardId: 'ht_the_come_up', name: 'The Come-Up', cost: 2, type: 'Operation', effect: 'juice', amount: 2, text: 'Gain 2 Juice this turn.' },
+  { cardId: 'pd_the_crib', name: 'The Crib', cost: 2, type: 'Piece', effect: 'cool', amount: 2, text: 'Lower your Heat by 2.' },
+  { cardId: 'ht_the_come_up', name: 'The Come-Up', cost: 2, type: 'Piece', effect: 'juice', amount: 2, text: 'Gain 2 Juice this turn.' },
   { cardId: 'w_stolen_whip', name: 'Stolen Whip', cost: 3, type: 'Vehicle', effect: 'summon', amount: 2, atk: 4, hp: 3, keywords: ['Drive-By'], text: '4/3. Drive-By: deal 2 to the enemy boss on arrival.' },
   { cardId: 'w_blow_the_safe', name: 'Blow the Safe', cost: 3, type: 'Job', effect: 'draw', amount: 2, text: 'Draw 2 cards.' },
   { cardId: 'w_shot_caller', name: 'Shot Caller', cost: 4, type: 'Operator', effect: 'summon', amount: 0, atk: 5, hp: 5, text: '5/5. Runs the crew.' },
@@ -256,7 +256,15 @@ export function applyAction(state: MatchState, action: MatchAction): { state: Ma
       emit({ type: 'operators.readied', player: next })
       const top = cur.seats[next].deck[0]
       if (top) emit({ type: 'card.drawn', player: next, card: top })
-      emit({ type: 'turn.ended', player: me, nextPlayer: next, nextPlayerJuice: clamp(cur.seats[next].juice + JUICE_RAMP_PER_TURN, 0, JUICE_CAP) })
+      // The available pool ramps (+1, capped) and so does the crystal it refills
+      // to — mirroring the aggregate's `next_player_juice`/`next_player_max_juice`.
+      emit({
+        type: 'turn.ended',
+        player: me,
+        nextPlayer: next,
+        nextPlayerJuice: clamp(cur.seats[next].juice + JUICE_RAMP_PER_TURN, 0, JUICE_CAP),
+        nextPlayerMaxJuice: clamp(cur.seats[next].maxJuice + JUICE_RAMP_PER_TURN, 0, JUICE_CAP),
+      })
       break
     }
     case 'ConcedeMatchCmd': {
@@ -368,6 +376,11 @@ export function foldEvent(state: MatchState, event: DeltaEvent): MatchState {
       return patchSeat(state, event.player, (s) => ({ ...s, heat: event.newHeat }))
     case 'boss.damaged':
       return patchSeat(state, event.player, (s) => ({ ...s, bossHp: event.newHp }))
+    case 'boss.armor.gained':
+      // GainArmor raises the activating seat's own Boss HP to the authoritative
+      // post-gain value — the mirror of boss.damaged, so an online client folds
+      // it instead of desyncing.
+      return patchSeat(state, event.player, (s) => ({ ...s, bossHp: event.newHp }))
     case 'juice.gained':
       return patchSeat(state, event.player, (s) => ({ ...s, juice: event.newJuice }))
     case 'operator.summoned':
@@ -396,7 +409,7 @@ export function foldEvent(state: MatchState, event: DeltaEvent): MatchState {
       return patchSeat(state, event.player, (s) => ({ ...s, juice: event.remainingJuice }))
     case 'turn.ended':
       return {
-        ...patchSeat(state, event.nextPlayer, (s) => ({ ...s, juice: event.nextPlayerJuice })),
+        ...patchSeat(state, event.nextPlayer, (s) => ({ ...s, juice: event.nextPlayerJuice, maxJuice: event.nextPlayerMaxJuice })),
         turn: event.nextPlayer,
       }
     case 'match.completed':

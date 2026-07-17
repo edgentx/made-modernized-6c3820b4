@@ -171,8 +171,10 @@ describe('aiTurn', () => {
 
 describe('foldEvent', () => {
   it('folds an authoritative turn.ended delta identically to a prediction', () => {
-    const folded = foldEvent(startMatch('m'), { type: 'turn.ended', player: 'A', nextPlayer: 'B', nextPlayerJuice: 4 })
+    const folded = foldEvent(startMatch('m'), { type: 'turn.ended', player: 'A', nextPlayer: 'B', nextPlayerJuice: 4, nextPlayerMaxJuice: 4 })
     expect(folded.turn).toBe('B')
     expect(folded.seats.B.juice).toBe(4)
+    // The grown crystal folds onto the incoming seat's max-Juice, not just its pool.
+    expect(folded.seats.B.maxJuice).toBe(4)
   })
 })
