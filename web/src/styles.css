@@ -1,9 +1,29 @@
+@import url('https://fonts.googleapis.com/css2?family=Bebas+Neue&family=Chakra+Petch:wght@500;600;700&family=Inter:wght@400;600;800&family=JetBrains+Mono:wght@400;600&display=swap');
+
 :root {
-  --bg: #0b0d12;
-  --surface: #151a23;
-  --text: #e7ecf3;
-  --muted: #8b97a8;
-  --accent: #4c8bf5;
+  /* MADE cyberpunk theme — ported from the made-site design reference:
+     cyan/magenta/amber neon on near-black, synthwave-grid mood. */
+  --bg: #04050a;
+  --bg-deep: #070912;
+  --surface: #12172a;
+  --surface-glass: rgba(18, 23, 42, 0.55);
+  --text: #e6f1ff;
+  --muted: #8493b4;
+  --faint: #4c5878;
+  --line: #1d2438;
+  --line-hot: rgba(0, 229, 255, 0.28);
+  --accent: #00e5ff;
+  --accent-glow: #6ef6ff;
+  --magenta: #ff2d8e;
+  --amber: #ffb01f;
+  --purple: #b14aff;
+  --font-display: 'Bebas Neue', 'Impact', sans-serif;
+  --font-tech: 'Chakra Petch', 'Bebas Neue', sans-serif;
+  --font-body: 'Inter', system-ui, sans-serif;
+  --font-mono: 'JetBrains Mono', 'Menlo', monospace;
+  --glow-cyan: 0 0 18px rgba(0, 229, 255, 0.45);
+  --glow-magenta: 0 0 18px rgba(255, 45, 142, 0.45);
+  --glow-amber: 0 0 18px rgba(255, 176, 31, 0.4);
   color-scheme: dark;
 }
 
@@ -19,9 +39,15 @@ body,
 }
 
 body {
-  background: var(--bg);
   color: var(--text);
-  font-family: system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
+  font-family: var(--font-body);
+  /* Synthwave ground: deep radial neon wash over a faint scanline grid. */
+  background-color: var(--bg);
+  background-image:
+    radial-gradient(1200px 600px at 50% -10%, rgba(0, 229, 255, 0.08), transparent 60%),
+    radial-gradient(900px 500px at 100% 110%, rgba(255, 45, 142, 0.07), transparent 60%),
+    linear-gradient(to bottom, transparent 0 2px, rgba(0, 229, 255, 0.035) 2px 4px);
+  background-attachment: fixed;
   /* Respect device safe areas (notches) in a native/standalone shell. */
   padding: env(safe-area-inset-top) env(safe-area-inset-right)
     env(safe-area-inset-bottom) env(safe-area-inset-left);
@@ -920,3 +946,378 @@ body {
     grid-template-columns: repeat(auto-fill, minmax(16rem, 1fr));
   }
 }
+
+/* ============================================================================
+   MADE cyberpunk theme layer — ported from the made-site design reference.
+   Applies the neon aesthetic on top of the existing BEM layout: display-font
+   headings with cyan glow, tech-font neon nav, glowing controls, glass cards,
+   scanline chrome. Kept as an append-only override so layout rules are intact.
+   ============================================================================ */
+
+/* Titles: condensed display face, uppercase, cyan neon with a magenta offset. */
+.view__title,
+.login__title,
+.shop__title,
+.deck__title,
+.ranks__title,
+.story__title,
+.match__title {
+  font-family: var(--font-display);
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--text);
+  text-shadow: 0 0 22px rgba(0, 229, 255, 0.35), 2px 2px 0 rgba(255, 45, 142, 0.55);
+}
+
+/* Section/sub headings + labels in the tech face. */
+.shop__section-title,
+.deck__pane-title,
+.shop__card-name,
+.deck__field-label,
+.story__boss-label,
+.app__nav-link {
+  font-family: var(--font-tech);
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+/* Numbers / costs / meta in mono. */
+.deck__cost,
+.deck__count,
+.shop__price,
+.deck__count-badge,
+.deck__meta,
+.match__action {
+  font-family: var(--font-mono);
+}
+
+/* Bottom nav: glass bar, hot cyan top line, glowing active tab. */
+.app__nav {
+  background: var(--surface-glass);
+  backdrop-filter: blur(8px);
+  border-top: 1px solid var(--line-hot);
+}
+.app__nav-link {
+  color: var(--muted);
+  border: 1px solid transparent;
+}
+.app__nav-link--active {
+  color: var(--accent);
+  background: linear-gradient(180deg, rgba(0, 229, 255, 0.16), rgba(0, 229, 255, 0.04));
+  border: 1px solid var(--line-hot);
+  box-shadow: var(--glow-cyan);
+  text-shadow: 0 0 10px rgba(0, 229, 255, 0.6);
+}
+
+/* Primary actions: neon cyan slab with glow; hover ramps the glow. */
+.deck__btn--primary,
+.shop__btn,
+.ranks__btn,
+.story__btn,
+.login__cta {
+  font-family: var(--font-tech);
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  color: #04141a;
+  background: linear-gradient(135deg, var(--accent), var(--accent-glow));
+  border: 1px solid var(--accent);
+  border-radius: 0.5rem;
+  box-shadow: var(--glow-cyan);
+  transition: box-shadow 0.15s ease, transform 0.05s ease;
+}
+/* Secondary text link ("use a different account"): keep it quiet, cyan tint. */
+.login__link {
+  color: var(--accent);
+  text-decoration-color: var(--line-hot);
+}
+.deck__btn--primary:hover,
+.shop__btn:hover,
+.ranks__btn:hover,
+.story__btn:hover,
+.login__cta:hover {
+  box-shadow: 0 0 26px rgba(0, 229, 255, 0.7);
+}
+.deck__btn--primary:active,
+.shop__btn:active,
+.ranks__btn:active,
+.story__btn:active {
+  transform: translateY(1px);
+}
+
+/* Cards / panels: dark glass with a hot cyan edge + depth glow. */
+.shop__card,
+.deck__pane,
+.deck__saved,
+.story,
+.ranks {
+  background: var(--surface-glass);
+  border: 1px solid var(--line);
+  border-radius: 0.75rem;
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.6), inset 0 0 0 1px rgba(0, 229, 255, 0.06);
+}
+.shop__card:hover {
+  border-color: var(--line-hot);
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.6), var(--glow-cyan);
+}
+
+/* Legendary / rarity accents pick up magenta + amber neon. */
+.deck__tag--legendary {
+  color: var(--amber);
+  text-shadow: var(--glow-amber);
+  border-color: var(--amber);
+}
+
+/* Errors in crit-magenta. */
+.deck__error,
+.shop__error,
+.story__error,
+.login__error {
+  color: var(--magenta);
+  text-shadow: var(--glow-magenta);
+}
+
+/* Inputs: dark field, cyan focus ring. */
+.deck__input,
+.deck__select,
+.deck__field {
+  background: var(--bg-deep);
+  color: var(--text);
+  border: 1px solid var(--line);
+  border-radius: 0.4rem;
+  font-family: var(--font-mono);
+}
+.deck__input:focus,
+.deck__select:focus {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: var(--glow-cyan);
+}
+
+/* ── Branded HUD header + responsive nav rail ──────────────────────────────
+   Mobile: brand on top, nav as a thumb-reachable bottom tab bar.
+   Wide (>=720px): brand + nav read as a top HUD console. */
+.app__brand {
+  display: flex;
+  align-items: baseline;
+  gap: 0.6rem;
+  padding: 0.6rem 1rem;
+  border-bottom: 1px solid var(--line-hot);
+  background: var(--surface-glass);
+  backdrop-filter: blur(8px);
+}
+.app__wordmark {
+  font-family: var(--font-display);
+  font-size: 1.9rem;
+  line-height: 1;
+  letter-spacing: 0.1em;
+  color: var(--text);
+  text-shadow: 0 0 22px rgba(0, 229, 255, 0.5), 2px 2px 0 rgba(255, 45, 142, 0.6);
+}
+.app__tagline {
+  font-family: var(--font-mono);
+  font-size: 0.7rem;
+  color: var(--muted);
+  letter-spacing: 0.08em;
+}
+
+/* Bottom tab bar on narrow screens keeps thumb reach (order: content, nav). */
+@media (max-width: 719px) {
+  .app__nav { order: 3; border-top: 1px solid var(--line-hot); border-bottom: none; }
+  .app__content { order: 2; }
+}
+/* Wide screens: nav becomes a centered top rail under the brand. */
+@media (min-width: 720px) {
+  .app__nav {
+    justify-content: center;
+    gap: 0.5rem;
+    border-bottom: 1px solid var(--line-hot);
+    border-top: none;
+  }
+  .app__nav-link { flex: 0 0 auto; padding: 0.5rem 1.1rem; }
+  .app__content { max-width: 1100px; margin: 0 auto; width: 100%; }
+}
+
+/* ============================================================================
+   Data-screen cyberpunk pass — leaderboard, shop grid, collection grid.
+   Targets each view's own BEM classes on top of the theme token layer.
+   ============================================================================ */
+
+/* ── Leaderboard: a neon ranked table ─────────────────────────────────────── */
+.ranks__head { display: flex; align-items: baseline; gap: 0.75rem; flex-wrap: wrap; margin-bottom: 0.75rem; }
+.ranks__season { font-family: var(--font-mono); color: var(--muted); font-size: 0.8rem; }
+.ranks__season-id { color: var(--accent); }
+.ranks__list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 0.4rem; }
+.ranks__list > * ,
+.ranks__row {
+  display: grid;
+  grid-template-columns: 3rem 1fr auto auto;
+  align-items: center;
+  gap: 0.75rem;
+  padding: 0.7rem 0.9rem;
+  background: var(--surface-glass);
+  border: 1px solid var(--line);
+  border-radius: 0.6rem;
+}
+.ranks__rank {
+  font-family: var(--font-display);
+  font-size: 1.3rem;
+  text-align: center;
+  color: var(--muted);
+}
+/* Top-3 get medal glows: cyan / magenta / amber. */
+.ranks__list > *:nth-child(1) { border-color: var(--line-hot); box-shadow: var(--glow-cyan); }
+.ranks__list > *:nth-child(1) .ranks__rank { color: var(--accent); text-shadow: 0 0 12px rgba(0,229,255,0.7); }
+.ranks__list > *:nth-child(2) .ranks__rank { color: var(--magenta); text-shadow: var(--glow-magenta); }
+.ranks__list > *:nth-child(3) .ranks__rank { color: var(--amber); text-shadow: var(--glow-amber); }
+.ranks__name { font-family: var(--font-tech); letter-spacing: 0.03em; }
+.ranks__rating { font-family: var(--font-mono); color: var(--accent); }
+.ranks__stars { font-family: var(--font-mono); color: var(--amber); }
+.ranks__pager { display: flex; align-items: center; gap: 0.75rem; justify-content: center; margin-top: 1rem; }
+.ranks__page-label { font-family: var(--font-mono); color: var(--muted); font-size: 0.85rem; }
+
+/* ── Shop: responsive neon card grid ──────────────────────────────────────── */
+.shop__grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+  gap: 1rem;
+  margin-top: 1rem;
+}
+.shop__card { display: flex; flex-direction: column; gap: 0.5rem; padding: 1rem; }
+.shop__card-head { display: flex; align-items: center; justify-content: space-between; gap: 0.5rem; }
+.shop__card-name { font-size: 1.05rem; }
+.shop__card-desc { color: var(--muted); font-size: 0.85rem; flex: 1; }
+.shop__kind {
+  font-family: var(--font-mono); font-size: 0.65rem; text-transform: uppercase; letter-spacing: 0.08em;
+  padding: 0.15rem 0.5rem; border-radius: 999px; border: 1px solid var(--line-hot); color: var(--accent);
+}
+.shop__kind--token { color: var(--magenta); border-color: rgba(255,45,142,0.4); }
+.shop__card--token { border-color: rgba(255,45,142,0.28); }
+.shop__card--token:hover { box-shadow: var(--glow-magenta); border-color: var(--magenta); }
+.shop__price { font-family: var(--font-mono); font-size: 1.15rem; color: var(--amber); text-shadow: var(--glow-amber); }
+
+/* ── Collection / deck builder: card grid with cost + rarity chips ─────────── */
+.deck__filters { display: flex; gap: 0.5rem; flex-wrap: wrap; margin: 0.75rem 0; }
+.deck__cards {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+  gap: 0.75rem;
+}
+.deck__card {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+  padding: 0.75rem;
+  min-height: 84px;
+  background: linear-gradient(160deg, var(--surface-glass), rgba(4,20,26,0.6));
+  border: 1px solid var(--line);
+  border-radius: 0.6rem;
+  transition: border-color 0.15s ease, box-shadow 0.15s ease, transform 0.05s ease;
+}
+.deck__card:hover { border-color: var(--line-hot); box-shadow: var(--glow-cyan); transform: translateY(-2px); }
+.deck__card-name { font-family: var(--font-tech); font-size: 0.9rem; letter-spacing: 0.02em; }
+/* Juice cost: a glowing cyan coin in the top-left. */
+.deck__cost {
+  position: absolute; top: -0.5rem; left: -0.5rem;
+  width: 1.7rem; height: 1.7rem; display: grid; place-items: center;
+  font-family: var(--font-mono); font-weight: 600; font-size: 0.85rem;
+  color: #04141a; background: linear-gradient(135deg, var(--accent), var(--accent-glow));
+  border-radius: 50%; box-shadow: var(--glow-cyan);
+}
+.deck__count-badge {
+  align-self: flex-end; font-family: var(--font-mono); font-size: 0.7rem;
+  color: var(--muted); padding: 0.1rem 0.4rem; border: 1px solid var(--line); border-radius: 999px;
+}
+.deck__head { display: flex; align-items: center; justify-content: space-between; gap: 0.75rem; flex-wrap: wrap; }
+.deck__empty, .shop__empty, .ranks__empty {
+  color: var(--muted); font-family: var(--font-mono); text-align: center; padding: 2rem;
+}
+
+/* ============================================================================
+   Match / Story / Login cyberpunk pass.
+   ============================================================================ */
+
+/* ── Match: HUD bar, neon segmented mode toggle, framed stage ──────────────── */
+.match__bar {
+  padding: 0.5rem 0.75rem;
+  background: var(--surface-glass);
+  border: 1px solid var(--line-hot);
+  border-radius: 0.6rem;
+}
+.match__modes {
+  display: inline-flex;
+  background: var(--bg-deep);
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  padding: 3px;
+}
+.match__mode {
+  border: none; background: none; cursor: pointer;
+  font-family: var(--font-tech); text-transform: uppercase; letter-spacing: 0.05em;
+  font-size: 0.72rem; color: var(--muted); padding: 0.35rem 0.9rem; border-radius: 999px;
+}
+.match__mode--on {
+  color: #04141a;
+  background: linear-gradient(135deg, var(--accent), var(--accent-glow));
+  box-shadow: var(--glow-cyan);
+}
+.match__status {
+  font-family: var(--font-mono); font-size: 0.72rem;
+  padding: 0.25rem 0.6rem; border-radius: 999px; border: 1px solid var(--line);
+  background: var(--bg-deep);
+}
+.match__status--open, .match__status--practice { color: var(--green); border-color: rgba(43,255,136,0.35); }
+.match__status--reconnecting { color: var(--amber); border-color: rgba(255,176,31,0.35); }
+.match__status--closed { color: var(--magenta); border-color: rgba(255,45,142,0.35); }
+.match__stage {
+  border: 1px solid var(--line-hot);
+  box-shadow: inset 0 0 40px rgba(0,229,255,0.06), 0 12px 40px rgba(0,0,0,0.6);
+  background:
+    linear-gradient(to bottom, transparent 0 2px, rgba(0,229,255,0.04) 2px 4px),
+    radial-gradient(120% 80% at 50% 0%, rgba(0,229,255,0.06), transparent 60%),
+    var(--bg-deep);
+}
+.match__action--primary {
+  color: #04141a; border-color: var(--accent);
+  background: linear-gradient(135deg, var(--accent), var(--accent-glow));
+  box-shadow: var(--glow-cyan);
+}
+.match__action--danger { color: var(--magenta); border-color: rgba(255,45,142,0.5); background: rgba(255,45,142,0.08); }
+.match__correction { background: rgba(255,45,142,0.12); border-color: rgba(255,45,142,0.5); color: var(--magenta-glow, #ff77c0); }
+
+/* ── Story: mission grid + boss HP bar ────────────────────────────────────── */
+.story__grid {
+  display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); gap: 1rem; margin-top: 1rem;
+}
+.story__boss {
+  padding: 1rem; border: 1px solid var(--line-hot);
+  background: linear-gradient(160deg, rgba(255,45,142,0.08), var(--surface-glass));
+  box-shadow: 0 12px 40px rgba(0,0,0,0.6), 0 0 24px rgba(255,45,142,0.15);
+}
+.story__boss-label { color: var(--magenta); font-size: 0.7rem; }
+.story__boss-name { font-family: var(--font-display); font-size: 1.4rem; letter-spacing: 0.04em; text-shadow: var(--glow-magenta); }
+.story__boss-hp {
+  height: 0.55rem; border-radius: 999px; overflow: hidden;
+  background: var(--bg-deep); border: 1px solid var(--line);
+  background-image: linear-gradient(90deg, var(--magenta), var(--amber));
+  box-shadow: 0 0 14px rgba(255,45,142,0.4);
+}
+.story__mission-name { font-family: var(--font-tech); letter-spacing: 0.02em; }
+.story__mission-desc { color: var(--muted); font-size: 0.85rem; }
+.story__ai-budget { font-family: var(--font-mono); font-size: 0.72rem; color: var(--purple); }
+.story__cleared {
+  font-family: var(--font-mono); font-size: 0.7rem; color: var(--green);
+  border: 1px solid rgba(43,255,136,0.4); border-radius: 999px; padding: 0.1rem 0.5rem;
+  text-shadow: 0 0 10px rgba(43,255,136,0.5);
+}
+
+/* ── Login polish ─────────────────────────────────────────────────────────── */
+.login { gap: 1.25rem; }
+.login__identity {
+  background: var(--surface-glass);
+  border: 1px solid var(--line-hot);
+  box-shadow: inset 0 0 0 1px rgba(0,229,255,0.05);
+}
+.login__identity dt { font-family: var(--font-mono); }
+.login__identity dd { font-family: var(--font-tech); }
+.login__note { font-family: var(--font-mono); color: var(--faint); }
