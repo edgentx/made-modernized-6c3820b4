@@ -121,7 +121,10 @@ async fn full_ws_match_persists_replay_and_reproduces_from_seed(pool: PgPool) {
     let mut applied_deltas: Vec<(u64, String)> = Vec::new();
     let mut completion = None;
     for (command, payload) in match_script(match_id, SEED) {
-        let applied = match state.hub.apply_action(match_id, command, actor_of(&payload), &payload) {
+        let applied = match state
+            .hub
+            .apply_action(match_id, command, actor_of(&payload), &payload)
+        {
             ApplyOutcome::Applied(applied) => applied,
             other => panic!("{command} was not applied: {other:?}"),
         };

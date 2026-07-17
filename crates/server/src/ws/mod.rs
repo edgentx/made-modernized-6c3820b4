@@ -230,7 +230,10 @@ async fn handle_action(
     payload: &serde_json::Value,
     session: &mut actix_ws::Session,
 ) {
-    match state.hub.apply_action(match_id, command, player_id, payload) {
+    match state
+        .hub
+        .apply_action(match_id, command, player_id, payload)
+    {
         ApplyOutcome::Applied(applied) => persist_applied(state, match_id, applied).await,
         // A rejection (optimistic-state correction) or unknown-match error goes
         // only to the acting client; the deltas of an accepted command reach it

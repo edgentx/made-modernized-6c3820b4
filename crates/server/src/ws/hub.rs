@@ -752,7 +752,8 @@ mod tests {
         // the action is accepted as A rather than rejected as the spoofed B
         // acting out of turn.
         let hub = started_hub("m-1");
-        let spoofed = serde_json::json!({ "playerId": outfit_b("m-1"), "matchId": "somewhere-else" });
+        let spoofed =
+            serde_json::json!({ "playerId": outfit_b("m-1"), "matchId": "somewhere-else" });
         match hub.apply_action("m-1", EndTurn::COMMAND, &outfit_a("m-1"), &spoofed) {
             ApplyOutcome::Applied(_) => {}
             other => panic!("envelope identity should override the payload, got {other:?}"),
@@ -767,13 +768,14 @@ mod tests {
         // Concede is exempt from the turn rule; player B forfeits, A wins.
         let concede = ConcedeMatch::new("m-1", outfit_b("m-1"));
         let payload = serde_json::to_value(&concede).unwrap();
-        let completion = match hub.apply_action("m-1", ConcedeMatch::COMMAND, &outfit_b("m-1"), &payload) {
-            ApplyOutcome::Applied(Applied {
-                completion: Some(c),
-                ..
-            }) => c,
-            other => panic!("expected a completion, got {other:?}"),
-        };
+        let completion =
+            match hub.apply_action("m-1", ConcedeMatch::COMMAND, &outfit_b("m-1"), &payload) {
+                ApplyOutcome::Applied(Applied {
+                    completion: Some(c),
+                    ..
+                }) => c,
+                other => panic!("expected a completion, got {other:?}"),
+            };
 
         assert_eq!(completion.winner, "A");
         assert_eq!(completion.replay_id, "m-1");
@@ -785,7 +787,12 @@ mod tests {
         let again = ConcedeMatch::new("m-1", outfit_a("m-1"));
         let again_payload = serde_json::to_value(&again).unwrap();
         assert!(matches!(
-            hub.apply_action("m-1", ConcedeMatch::COMMAND, &outfit_a("m-1"), &again_payload),
+            hub.apply_action(
+                "m-1",
+                ConcedeMatch::COMMAND,
+                &outfit_a("m-1"),
+                &again_payload
+            ),
             ApplyOutcome::Rejected(_)
         ));
     }

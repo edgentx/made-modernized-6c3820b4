@@ -695,8 +695,7 @@ impl ResolveVenueEvent {
     /// ready to hand to [`GameSession::execute`].
     pub fn into_command(&self) -> Command {
         // Serialization of a plain data struct to a Vec cannot fail here.
-        let payload =
-            serde_json::to_vec(self).expect("ResolveVenueEvent is always serializable");
+        let payload = serde_json::to_vec(self).expect("ResolveVenueEvent is always serializable");
         Command::with_payload(Self::COMMAND, payload)
     }
 }
@@ -1180,13 +1179,13 @@ impl Keyword {
 /// resolved play-stats. Populated from CardDefinition fields at deck-build.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct CardInstance {
-    pub instance_id: String,       // e.g. "A-w_the_homie-3"
-    pub card_id: String,           // definition id
+    pub instance_id: String, // e.g. "A-w_the_homie-3"
+    pub card_id: String,     // definition id
     pub cost: u8,
-    pub card_type: CardType,       // Operator/Job/Piece/Vehicle/Heist
-    pub effect: CardEffect,        // resolved effect + amount
-    pub atk: u8,                   // 0 for non-unit cards
-    pub hp: u8,                    // 0 for non-unit cards
+    pub card_type: CardType, // Operator/Job/Piece/Vehicle/Heist
+    pub effect: CardEffect,  // resolved effect + amount
+    pub atk: u8,             // 0 for non-unit cards
+    pub hp: u8,              // 0 for non-unit cards
     pub keywords: Vec<Keyword>,
     pub boss_lock: Option<String>, // Some(boss_id) if boss-locked (Task 8)
     /// The card's class allegiance (Task 10, City-pillar hook); defaults to
@@ -1287,20 +1286,132 @@ struct PoolCard {
 /// effects+amounts, stats, and keywords — so a Rust-dealt deck matches a
 /// WASM-predicted one.
 const CARD_POOL: &[PoolCard] = &[
-    PoolCard { card_id: "bolt", cost: 1, card_type: CardType::Job, effect: CardEffect::DealDamage { amount: 3 }, atk: 0, hp: 0, keywords: &[] },
-    PoolCard { card_id: "w_corner_boy", cost: 1, card_type: CardType::Operator, effect: CardEffect::Summon, atk: 1, hp: 2, keywords: &[] },
-    PoolCard { card_id: "pd_beat_cop", cost: 1, card_type: CardType::Operator, effect: CardEffect::Summon, atk: 1, hp: 2, keywords: &[] },
-    PoolCard { card_id: "w_young_buck", cost: 1, card_type: CardType::Operator, effect: CardEffect::Summon, atk: 2, hp: 1, keywords: &[] },
-    PoolCard { card_id: "w_drive_by", cost: 2, card_type: CardType::Job, effect: CardEffect::DealDamage { amount: 4 }, atk: 0, hp: 0, keywords: &[] },
-    PoolCard { card_id: "w_the_homie", cost: 2, card_type: CardType::Operator, effect: CardEffect::Summon, atk: 3, hp: 2, keywords: &[] },
-    PoolCard { card_id: "w_the_enforcer", cost: 3, card_type: CardType::Operator, effect: CardEffect::Summon, atk: 2, hp: 5, keywords: &[Keyword::Spotlight] },
-    PoolCard { card_id: "pd_riot_squad", cost: 5, card_type: CardType::Operator, effect: CardEffect::Summon, atk: 4, hp: 5, keywords: &[Keyword::Spotlight] },
-    PoolCard { card_id: "pd_the_crib", cost: 2, card_type: CardType::Piece, effect: CardEffect::Cool { amount: 2 }, atk: 0, hp: 0, keywords: &[] },
-    PoolCard { card_id: "ht_the_come_up", cost: 2, card_type: CardType::Piece, effect: CardEffect::GainJuice { amount: 2 }, atk: 0, hp: 0, keywords: &[] },
-    PoolCard { card_id: "w_stolen_whip", cost: 3, card_type: CardType::Vehicle, effect: CardEffect::Summon, atk: 4, hp: 3, keywords: &[Keyword::DriveBy] },
-    PoolCard { card_id: "w_blow_the_safe", cost: 3, card_type: CardType::Job, effect: CardEffect::DrawCards { amount: 2 }, atk: 0, hp: 0, keywords: &[] },
-    PoolCard { card_id: "w_shot_caller", cost: 4, card_type: CardType::Operator, effect: CardEffect::Summon, atk: 5, hp: 5, keywords: &[] },
-    PoolCard { card_id: "w_the_big_one", cost: 5, card_type: CardType::Heist, effect: CardEffect::DealDamage { amount: 7 }, atk: 0, hp: 0, keywords: &[] },
+    PoolCard {
+        card_id: "bolt",
+        cost: 1,
+        card_type: CardType::Job,
+        effect: CardEffect::DealDamage { amount: 3 },
+        atk: 0,
+        hp: 0,
+        keywords: &[],
+    },
+    PoolCard {
+        card_id: "w_corner_boy",
+        cost: 1,
+        card_type: CardType::Operator,
+        effect: CardEffect::Summon,
+        atk: 1,
+        hp: 2,
+        keywords: &[],
+    },
+    PoolCard {
+        card_id: "pd_beat_cop",
+        cost: 1,
+        card_type: CardType::Operator,
+        effect: CardEffect::Summon,
+        atk: 1,
+        hp: 2,
+        keywords: &[],
+    },
+    PoolCard {
+        card_id: "w_young_buck",
+        cost: 1,
+        card_type: CardType::Operator,
+        effect: CardEffect::Summon,
+        atk: 2,
+        hp: 1,
+        keywords: &[],
+    },
+    PoolCard {
+        card_id: "w_drive_by",
+        cost: 2,
+        card_type: CardType::Job,
+        effect: CardEffect::DealDamage { amount: 4 },
+        atk: 0,
+        hp: 0,
+        keywords: &[],
+    },
+    PoolCard {
+        card_id: "w_the_homie",
+        cost: 2,
+        card_type: CardType::Operator,
+        effect: CardEffect::Summon,
+        atk: 3,
+        hp: 2,
+        keywords: &[],
+    },
+    PoolCard {
+        card_id: "w_the_enforcer",
+        cost: 3,
+        card_type: CardType::Operator,
+        effect: CardEffect::Summon,
+        atk: 2,
+        hp: 5,
+        keywords: &[Keyword::Spotlight],
+    },
+    PoolCard {
+        card_id: "pd_riot_squad",
+        cost: 5,
+        card_type: CardType::Operator,
+        effect: CardEffect::Summon,
+        atk: 4,
+        hp: 5,
+        keywords: &[Keyword::Spotlight],
+    },
+    PoolCard {
+        card_id: "pd_the_crib",
+        cost: 2,
+        card_type: CardType::Piece,
+        effect: CardEffect::Cool { amount: 2 },
+        atk: 0,
+        hp: 0,
+        keywords: &[],
+    },
+    PoolCard {
+        card_id: "ht_the_come_up",
+        cost: 2,
+        card_type: CardType::Piece,
+        effect: CardEffect::GainJuice { amount: 2 },
+        atk: 0,
+        hp: 0,
+        keywords: &[],
+    },
+    PoolCard {
+        card_id: "w_stolen_whip",
+        cost: 3,
+        card_type: CardType::Vehicle,
+        effect: CardEffect::Summon,
+        atk: 4,
+        hp: 3,
+        keywords: &[Keyword::DriveBy],
+    },
+    PoolCard {
+        card_id: "w_blow_the_safe",
+        cost: 3,
+        card_type: CardType::Job,
+        effect: CardEffect::DrawCards { amount: 2 },
+        atk: 0,
+        hp: 0,
+        keywords: &[],
+    },
+    PoolCard {
+        card_id: "w_shot_caller",
+        cost: 4,
+        card_type: CardType::Operator,
+        effect: CardEffect::Summon,
+        atk: 5,
+        hp: 5,
+        keywords: &[],
+    },
+    PoolCard {
+        card_id: "w_the_big_one",
+        cost: 5,
+        card_type: CardType::Heist,
+        effect: CardEffect::DealDamage { amount: 7 },
+        atk: 0,
+        hp: 0,
+        keywords: &[],
+    },
 ];
 
 /// The client's mulberry32 PRNG (web/src/match/rules.ts:71), reproduced exactly
@@ -2041,7 +2152,11 @@ impl GameSession {
             .iter()
             .filter(|u| u.is_vehicle == is_vehicle)
             .count();
-        let cap = if is_vehicle { MAX_VEHICLES } else { MAX_OPERATORS };
+        let cap = if is_vehicle {
+            MAX_VEHICLES
+        } else {
+            MAX_OPERATORS
+        };
         if count >= cap {
             return Err(DomainError::InvariantViolation(format!(
                 "{seat:?}'s board is at the {} cap of {cap}",
@@ -2110,7 +2225,12 @@ impl GameSession {
     /// Summon puts an unready [`BoardUnit`] on `seat`'s board (firing Drive-By at
     /// the enemy Boss on arrival); DealDamage hits the target; GainJuice/Cool
     /// adjust resources; DrawCards pulls from the deck.
-    fn resolve_effect(&mut self, seat: Player, card: &CardInstance, target_ref: &str) -> Vec<Event> {
+    fn resolve_effect(
+        &mut self,
+        seat: Player,
+        card: &CardInstance,
+        target_ref: &str,
+    ) -> Vec<Event> {
         let foe = Self::opponent_of(seat);
         let mid = self.match_id.clone();
         let mut out = Vec::new();
@@ -3186,7 +3306,10 @@ mod tests {
         assert_eq!(session.seat_state_at(Player::A).hand.len(), OPENING_HAND);
         assert_eq!(session.seat_state_at(Player::B).hand.len(), OPENING_HAND);
         // The remainder of the 30-card deck stays behind the hand.
-        assert_eq!(session.seat_state_at(Player::A).deck.len(), 30 - OPENING_HAND);
+        assert_eq!(
+            session.seat_state_at(Player::A).deck.len(),
+            30 - OPENING_HAND
+        );
         // Deterministic: same seed => identical opening hand instance ids.
         let mut again = valid_session();
         again.execute(valid_cmd().into_command()).unwrap();
@@ -3739,15 +3862,18 @@ mod tests {
     fn play_summon_card_puts_unit_on_board_unready() {
         let mut session = seated_match();
         // Put a known summon card in A's hand: a 3/2 Operator, cost 2, Summon.
-        session.seat_state_at_mut(Player::A).hand.push(test_card_instance(
-            "A-homie-0",
-            2,
-            CardType::Operator,
-            CardEffect::Summon,
-            3,
-            2,
-            &[],
-        ));
+        session
+            .seat_state_at_mut(Player::A)
+            .hand
+            .push(test_card_instance(
+                "A-homie-0",
+                2,
+                CardType::Operator,
+                CardEffect::Summon,
+                3,
+                2,
+                &[],
+            ));
         give_juice(&mut session, Player::A, 5);
 
         let events = session
@@ -3775,15 +3901,18 @@ mod tests {
     #[test]
     fn play_damage_card_hits_the_boss() {
         let mut session = seated_match();
-        session.seat_state_at_mut(Player::A).hand.push(test_card_instance(
-            "A-bolt-0",
-            1,
-            CardType::Job,
-            CardEffect::DealDamage { amount: 3 },
-            0,
-            0,
-            &[],
-        ));
+        session
+            .seat_state_at_mut(Player::A)
+            .hand
+            .push(test_card_instance(
+                "A-bolt-0",
+                1,
+                CardType::Job,
+                CardEffect::DealDamage { amount: 3 },
+                0,
+                0,
+                &[],
+            ));
         give_juice(&mut session, Player::A, 5);
         let mut b = OutfitConfig::new("m-1-b");
         b.boss_hp = 10;
@@ -3799,15 +3928,18 @@ mod tests {
     fn play_driveby_summon_also_hits_enemy_boss() {
         let mut session = seated_match();
         // Stolen Whip: 4/3 Vehicle, Drive-By amount 2.
-        session.seat_state_at_mut(Player::A).hand.push(test_card_instance(
-            "A-whip-0",
-            3,
-            CardType::Vehicle,
-            CardEffect::Summon,
-            4,
-            3,
-            &[Keyword::DriveBy],
-        ));
+        session
+            .seat_state_at_mut(Player::A)
+            .hand
+            .push(test_card_instance(
+                "A-whip-0",
+                3,
+                CardType::Vehicle,
+                CardEffect::Summon,
+                4,
+                3,
+                &[Keyword::DriveBy],
+            ));
         give_juice(&mut session, Player::A, 5);
         let mut b = OutfitConfig::new("m-1-b");
         b.boss_hp = 10;
@@ -3827,20 +3959,27 @@ mod tests {
     fn summon_rejected_when_operator_board_full() {
         let mut session = seated_match();
         for i in 0..MAX_OPERATORS {
-            session
-                .seat_state_at_mut(Player::A)
-                .board
-                .push(test_unit(&format!("A-op-{i}"), 1, 1, true, false, &[]));
+            session.seat_state_at_mut(Player::A).board.push(test_unit(
+                &format!("A-op-{i}"),
+                1,
+                1,
+                true,
+                false,
+                &[],
+            ));
         }
-        session.seat_state_at_mut(Player::A).hand.push(test_card_instance(
-            "A-homie-0",
-            2,
-            CardType::Operator,
-            CardEffect::Summon,
-            3,
-            2,
-            &[],
-        ));
+        session
+            .seat_state_at_mut(Player::A)
+            .hand
+            .push(test_card_instance(
+                "A-homie-0",
+                2,
+                CardType::Operator,
+                CardEffect::Summon,
+                3,
+                2,
+                &[],
+            ));
         give_juice(&mut session, Player::A, 5);
         let err = session
             .execute(PlayCard::new("m-1", "m-1-a", "A-homie-0", "boss:B", 2).into_command())
@@ -3855,15 +3994,18 @@ mod tests {
         let mut session = valid_session();
         // Seat the played instance in A's hand with a no-op effect, so only the
         // card.played + heat.raised deltas are emitted (no effect deltas).
-        session.seat_state_at_mut(Player::A).hand.push(test_card_instance(
-            "card-instance-1",
-            2,
-            CardType::Job,
-            CardEffect::None,
-            0,
-            0,
-            &[],
-        ));
+        session
+            .seat_state_at_mut(Player::A)
+            .hand
+            .push(test_card_instance(
+                "card-instance-1",
+                2,
+                CardType::Job,
+                CardEffect::None,
+                0,
+                0,
+                &[],
+            ));
 
         let events = session
             .execute(valid_play_card().into_command())
@@ -3909,15 +4051,18 @@ mod tests {
         a.available_juice = 5;
         session.configure_player_a(a);
         session.set_opening_player(Some(Player::A));
-        session.seat_state_at_mut(Player::A).hand.push(test_card_instance(
-            "card-instance-1",
-            3,
-            CardType::Job,
-            CardEffect::None,
-            0,
-            0,
-            &[],
-        ));
+        session
+            .seat_state_at_mut(Player::A)
+            .hand
+            .push(test_card_instance(
+                "card-instance-1",
+                3,
+                CardType::Job,
+                CardEffect::None,
+                0,
+                0,
+                &[],
+            ));
 
         session
             .execute(PlayCard::new("m-1", "m-1-a", "card-instance-1", "boss:B", 3).into_command())
@@ -3936,15 +4081,18 @@ mod tests {
         a.available_juice = 5;
         session.configure_player_a(a);
         session.set_opening_player(Some(Player::A));
-        session.seat_state_at_mut(Player::A).hand.push(test_card_instance(
-            "card-instance-1",
-            1,
-            CardType::Job,
-            CardEffect::None,
-            0,
-            0,
-            &[],
-        ));
+        session
+            .seat_state_at_mut(Player::A)
+            .hand
+            .push(test_card_instance(
+                "card-instance-1",
+                1,
+                CardType::Job,
+                CardEffect::None,
+                0,
+                0,
+                &[],
+            ));
 
         session
             .execute(PlayCard::new("m-1", "m-1-a", "card-instance-1", "boss:B", 1).into_command())
@@ -3968,15 +4116,18 @@ mod tests {
         session.set_opening_player(Some(Player::A));
         // Seat the played instance so the rejection is the affordability check
         // (cost 4 > available 3), proving that rejection mutates no Juice.
-        session.seat_state_at_mut(Player::A).hand.push(test_card_instance(
-            "card-instance-1",
-            4,
-            CardType::Job,
-            CardEffect::None,
-            0,
-            0,
-            &[],
-        ));
+        session
+            .seat_state_at_mut(Player::A)
+            .hand
+            .push(test_card_instance(
+                "card-instance-1",
+                4,
+                CardType::Job,
+                CardEffect::None,
+                0,
+                0,
+                &[],
+            ));
 
         let _ = session
             .execute(PlayCard::new("m-1", "m-1-a", "card-instance-1", "boss:B", 4).into_command())
@@ -3995,15 +4146,18 @@ mod tests {
     fn play_card_rejects_when_cost_exceeds_available_juice() {
         let mut session = valid_session();
         // Default available Juice is 3; a cost of 4 cannot be afforded.
-        session.seat_state_at_mut(Player::A).hand.push(test_card_instance(
-            "card-instance-1",
-            4,
-            CardType::Job,
-            CardEffect::None,
-            0,
-            0,
-            &[],
-        ));
+        session
+            .seat_state_at_mut(Player::A)
+            .hand
+            .push(test_card_instance(
+                "card-instance-1",
+                4,
+                CardType::Job,
+                CardEffect::None,
+                0,
+                0,
+                &[],
+            ));
         let err = session
             .execute(PlayCard::new("m-1", "m-1-a", "card-instance-1", "target-1", 4).into_command())
             .expect_err("a card the player cannot afford must be rejected");
@@ -4205,8 +4359,25 @@ mod tests {
     // ---- AttackCmd (S-5) ---------------------------------------------------
 
     /// Build a board unit for combat tests.
-    fn test_unit(id: &str, atk: u8, hp: u8, ready: bool, is_vehicle: bool, kws: &[Keyword]) -> BoardUnit {
-        BoardUnit { instance_id: id.to_string(), card_id: "test".to_string(), atk, hp, max_hp: hp, ready, is_vehicle, keywords: kws.to_vec(), class: CardClass::Neutral }
+    fn test_unit(
+        id: &str,
+        atk: u8,
+        hp: u8,
+        ready: bool,
+        is_vehicle: bool,
+        kws: &[Keyword],
+    ) -> BoardUnit {
+        BoardUnit {
+            instance_id: id.to_string(),
+            card_id: "test".to_string(),
+            atk,
+            hp,
+            max_hp: hp,
+            ready,
+            is_vehicle,
+            keywords: kws.to_vec(),
+            class: CardClass::Neutral,
+        }
     }
 
     /// Build a Hacker-class board unit for location-modifier seam tests
@@ -4222,17 +4393,31 @@ mod tests {
         let mut session = valid_session();
         session.set_opening_player(Some(Player::A));
         // A attacker 3/2, B defender 2/5.
-        session.seat_state_at_mut(Player::A).board.push(test_unit("A-atk", 3, 2, true, false, &[]));
-        session.seat_state_at_mut(Player::B).board.push(test_unit("B-def", 2, 5, true, false, &[]));
+        session
+            .seat_state_at_mut(Player::A)
+            .board
+            .push(test_unit("A-atk", 3, 2, true, false, &[]));
+        session
+            .seat_state_at_mut(Player::B)
+            .board
+            .push(test_unit("B-def", 2, 5, true, false, &[]));
 
         let events = session
             .execute(Attack::new("m-1", "m-1-a", "A-atk", "op:B-def").into_command())
             .expect("A attacks B's unit");
 
         // Defender took 3 (5 -> 2); attacker took retaliation 2 (2 -> 0) and died.
-        assert!(events.iter().any(|e| matches!(e, Event::OperatorDamaged(d) if d.instance_id == "B-def" && d.new_hp == 2)));
-        assert!(events.iter().any(|e| matches!(e, Event::OperatorDied(d) if d.instance_id == "A-atk")));
-        assert!(session.seat_state_at(Player::A).board.iter().all(|u| u.instance_id != "A-atk"));
+        assert!(events.iter().any(
+            |e| matches!(e, Event::OperatorDamaged(d) if d.instance_id == "B-def" && d.new_hp == 2)
+        ));
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, Event::OperatorDied(d) if d.instance_id == "A-atk")));
+        assert!(session
+            .seat_state_at(Player::A)
+            .board
+            .iter()
+            .all(|u| u.instance_id != "A-atk"));
     }
 
     #[test]
@@ -4242,22 +4427,39 @@ mod tests {
         let mut b = OutfitConfig::new("m-1-b");
         b.boss_hp = 3;
         session.configure_player_b(b);
-        session.seat_state_at_mut(Player::A).board.push(test_unit("A-atk", 5, 5, true, false, &[]));
+        session
+            .seat_state_at_mut(Player::A)
+            .board
+            .push(test_unit("A-atk", 5, 5, true, false, &[]));
 
         let events = session
             .execute(Attack::new("m-1", "m-1-a", "A-atk", "boss:B").into_command())
             .expect("A attacks B's boss");
 
-        assert!(events.iter().any(|e| matches!(e, Event::BossDamaged(d) if d.new_hp == 0)));
-        assert!(events.iter().any(|e| matches!(e, Event::BossDefeated(d) if d.winner == Player::A)));
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, Event::BossDamaged(d) if d.new_hp == 0)));
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, Event::BossDefeated(d) if d.winner == Player::A)));
     }
 
     #[test]
     fn spotlight_forces_attack_onto_taunt_unit() {
         let mut session = valid_session();
         session.set_opening_player(Some(Player::A));
-        session.seat_state_at_mut(Player::A).board.push(test_unit("A-atk", 2, 2, true, false, &[]));
-        session.seat_state_at_mut(Player::B).board.push(test_unit("B-taunt", 0, 4, true, false, &[Keyword::Spotlight]));
+        session
+            .seat_state_at_mut(Player::A)
+            .board
+            .push(test_unit("A-atk", 2, 2, true, false, &[]));
+        session.seat_state_at_mut(Player::B).board.push(test_unit(
+            "B-taunt",
+            0,
+            4,
+            true,
+            false,
+            &[Keyword::Spotlight],
+        ));
         // Attacking the boss while a Spotlight unit stands is rejected.
         let err = session
             .execute(Attack::new("m-1", "m-1-a", "A-atk", "boss:B").into_command())
@@ -4297,12 +4499,10 @@ mod tests {
             .execute(Attack::new("m-1", "m-1-a", "A-atk", "boss:B").into_command())
             .expect("a valid attack should succeed");
 
-        assert!(events
-            .iter()
-            .any(|e| matches!(e, Event::BossDamaged(d) if d.player == Player::B && d.new_hp == 26)));
-        assert!(!events
-            .iter()
-            .any(|e| matches!(e, Event::BossDefeated(_))));
+        assert!(events.iter().any(
+            |e| matches!(e, Event::BossDamaged(d) if d.player == Player::B && d.new_hp == 26)
+        ));
+        assert!(!events.iter().any(|e| matches!(e, Event::BossDefeated(_))));
         assert!(events
             .iter()
             .any(|e| matches!(e, Event::OperatorExhausted(d) if d.instance_id == "A-atk")));
@@ -4470,9 +4670,7 @@ mod tests {
     fn declare_attack_rejects_when_command_targets_a_different_match() {
         let mut session = valid_session();
         let err = session
-            .execute(
-                Attack::new("other-match", "m-1-a", "attacker-1", "boss:B").into_command(),
-            )
+            .execute(Attack::new("other-match", "m-1-a", "attacker-1", "boss:B").into_command())
             .expect_err("a mismatched match id must be rejected");
         assert!(matches!(err, DomainError::InvariantViolation(_)));
         assert_eq!(session.version(), 0);
@@ -4963,8 +5161,18 @@ mod tests {
     #[test]
     fn play_gain_juice_card_emits_juice_gained_delta() {
         let mut session = seated_match();
-        session.seat_state_at_mut(Player::A).hand.push(
-            test_card_instance("A-comeup-0", 2, CardType::Piece, CardEffect::GainJuice { amount: 2 }, 0, 0, &[]));
+        session
+            .seat_state_at_mut(Player::A)
+            .hand
+            .push(test_card_instance(
+                "A-comeup-0",
+                2,
+                CardType::Piece,
+                CardEffect::GainJuice { amount: 2 },
+                0,
+                0,
+                &[],
+            ));
         give_juice(&mut session, Player::A, 5);
 
         // Deviation from the brief's verbatim "": play_card unconditionally
@@ -4986,11 +5194,24 @@ mod tests {
     fn play_cool_card_emits_heat_set_delta() {
         let mut session = seated_match();
         // Seat A starts with some heat so Cool has something to lower.
-        let mut a = OutfitConfig::new("m-1-a"); a.max_juice = 5; a.available_juice = 5; a.starting_heat = 4;
+        let mut a = OutfitConfig::new("m-1-a");
+        a.max_juice = 5;
+        a.available_juice = 5;
+        a.starting_heat = 4;
         session.configure_player_a(a);
         session.set_opening_player(Some(Player::A));
-        session.seat_state_at_mut(Player::A).hand.push(
-            test_card_instance("A-crib-0", 2, CardType::Piece, CardEffect::Cool { amount: 2 }, 0, 0, &[]));
+        session
+            .seat_state_at_mut(Player::A)
+            .hand
+            .push(test_card_instance(
+                "A-crib-0",
+                2,
+                CardType::Piece,
+                CardEffect::Cool { amount: 2 },
+                0,
+                0,
+                &[],
+            ));
 
         // Deviation from the brief's verbatim "": see the identical note in
         // play_gain_juice_card_emits_juice_gained_delta above.
@@ -4999,7 +5220,9 @@ mod tests {
             .expect("cool card plays");
 
         // Heat 4, +1 from playing the card (HEAT_PER_PLAY), then Cool -2 -> 3.
-        assert!(events.iter().any(|e| matches!(e, Event::HeatSet(h) if h.player == Player::A && h.new_heat == 3)));
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, Event::HeatSet(h) if h.player == Player::A && h.new_heat == 3)));
     }
 
     // Scenario (Task 7.5 remediation): a GainArmor hero power raises boss_hp
@@ -5008,8 +5231,12 @@ mod tests {
     #[test]
     fn hero_power_gain_armor_emits_boss_armor_gained_delta() {
         let mut session = seated_match();
-        let mut a = OutfitConfig::new("m-1-a"); a.max_juice = 5; a.available_juice = 5;
-        a.boss_hp = 30; a.hero_power_effect = domain::boss_definition::HeroPowerEffect::GainArmor { amount: 4 }; a.hero_power_cost = 2;
+        let mut a = OutfitConfig::new("m-1-a");
+        a.max_juice = 5;
+        a.available_juice = 5;
+        a.boss_hp = 30;
+        a.hero_power_effect = domain::boss_definition::HeroPowerEffect::GainArmor { amount: 4 };
+        a.hero_power_cost = 2;
         session.configure_player_a(a);
         session.set_opening_player(Some(Player::A));
 
@@ -5395,7 +5622,10 @@ mod tests {
         let mut session = valid_session();
         session.set_opening_player(Some(Player::A));
         // B (the incoming seat) has an UNREADY unit (as if summoned last turn).
-        session.seat_state_at_mut(Player::B).board.push(test_unit("B-op", 2, 2, false, false, &[]));
+        session
+            .seat_state_at_mut(Player::B)
+            .board
+            .push(test_unit("B-op", 2, 2, false, false, &[]));
 
         let events = session
             .execute(EndTurn::new("m-1", "m-1-a").into_command())
@@ -5403,11 +5633,17 @@ mod tests {
 
         // The incoming seat's unit is now ready...
         assert!(
-            session.seat_state_at(Player::B).board.iter().all(|u| u.ready),
+            session
+                .seat_state_at(Player::B)
+                .board
+                .iter()
+                .all(|u| u.ready),
             "incoming seat's units must be readied at turn start"
         );
         // ...and an OperatorsReadied delta was emitted for B.
-        assert!(events.iter().any(|e| matches!(e, Event::OperatorsReadied(r) if r.player == Player::B)));
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, Event::OperatorsReadied(r) if r.player == Player::B)));
     }
 
     // The OUTGOING seat's units are NOT readied by the opponent's turn start.
@@ -5415,7 +5651,10 @@ mod tests {
     fn end_turn_does_not_ready_outgoing_seats_units() {
         let mut session = valid_session();
         session.set_opening_player(Some(Player::A));
-        session.seat_state_at_mut(Player::A).board.push(test_unit("A-op", 2, 2, false, false, &[]));
+        session
+            .seat_state_at_mut(Player::A)
+            .board
+            .push(test_unit("A-op", 2, 2, false, false, &[]));
 
         session
             .execute(EndTurn::new("m-1", "m-1-a").into_command())
@@ -5423,7 +5662,11 @@ mod tests {
 
         // A is now the outgoing seat; its freshly-summoned unit stays unready until A's next turn.
         assert!(
-            session.seat_state_at(Player::A).board.iter().all(|u| !u.ready),
+            session
+                .seat_state_at(Player::A)
+                .board
+                .iter()
+                .all(|u| !u.ready),
             "the outgoing seat's units must not be readied by the opponent's turn start"
         );
     }
@@ -6005,7 +6248,9 @@ mod tests {
         let events = session
             .execute(ResolveVenueEvent::new("m-1", "table-noop", 0).into_command())
             .expect("venue event resolves");
-        assert!(events.iter().any(|e| e.event_type() == "venue.event.resolved"));
+        assert!(events
+            .iter()
+            .any(|e| e.event_type() == "venue.event.resolved"));
     }
 
     #[test]
